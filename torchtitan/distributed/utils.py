@@ -540,12 +540,14 @@ def clip_grad_norm_(
             pp_mesh,
         )
 
+    from torchtitan.distributed.flex_shard_fsdp import grads_for_norm
+
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
     else:
         # prevent generators from being exhausted
         parameters = list(parameters)
-    grads = [p.grad for p in parameters if p.grad is not None]
+    grads = grads_for_norm(parameters)
     total_norm = torch.nn.utils.get_total_norm(
         grads, norm_type, error_if_nonfinite, foreach
     )
