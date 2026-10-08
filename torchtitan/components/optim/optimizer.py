@@ -326,6 +326,14 @@ class OptimizersContainer(Optimizer, Stateful, Configurable):
                         return state_dict
 
                     optimizer.register_state_dict_post_hook(_save_host_lr)
+                # FlexShard's root module finds the bucket of a parameter.
+                if hasattr(model, "bucket_storage_of"):
+                    # Make optimizer.state_dict() declare where each state
+                    # tensor's local shard sits, as DCP needs for FlexShard.
+                    # pyrefly: ignore [missing-import]
+                    from flex_shard import register_optimizer_checkpoint_hook
+
+                    register_optimizer_checkpoint_hook(optimizer, model)
                 self.optimizers.append(optimizer)
                 self._log_optimizer(
                     optimizer,
