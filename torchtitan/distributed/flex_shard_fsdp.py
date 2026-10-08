@@ -126,7 +126,7 @@ def apply_flex_shard_to_decoder(
 
     def add_bucket(
         patterns: list[str], reshard_after_forward: bool, mesh: DeviceMesh = dp_mesh
-    ) -> None:
+    ) -> int:
         buckets.append(
             BucketSpec(
                 patterns,
@@ -138,14 +138,19 @@ def apply_flex_shard_to_decoder(
                 fsdp2_compatible=True,
             )
         )
+        return len(buckets) - 1
 
-    def add_module_bucket(module_fqns: list[str], reshard_after_forward: bool) -> None:
+    def add_module_bucket(module_fqns: list[str], reshard_after_forward: bool) -> int:
         for fqn in module_fqns:
             bucketed_params.update(model.get_submodule(fqn).parameters())
-        add_bucket(module_fqns, reshard_after_forward)
+        return add_bucket(module_fqns, reshard_after_forward)
 
+    # Bucket indices, for the explicit prefetch under expert parallelism.
+    embedding_bucket = head_bucket = None
+    block_buckets: list[list[int]] = []
+    expert_buckets: list[int] = []
     if model.enable_weight_tying:
-        add_module_bucket(
+        embedding_bucket = head_bucket = add_module_bucket(
             [
                 name
                 for name in ("tok_embeddings", "norm", "lm_head")
@@ -155,9 +160,11 @@ def apply_flex_shard_to_decoder(
         )
     else:
         if model.tok_embeddings is not None:
-            add_module_bucket(["tok_embeddings"], reshard_after_forward)
+            embedding_bucket = add_module_bucket(
+                ["tok_embeddings"], reshard_after_forward
+            )
         if model.norm is not None and model.lm_head is not None:
-            add_module_bucket(
+            head_bucket = add_module_bucket(
                 ["norm", "lm_head"], reshard_after_forward_policy == "always"
             )
     param_fqns = {param: fqn for fqn, param in model.named_parameters()}
@@ -180,7 +187,9 @@ def apply_flex_shard_to_decoder(
             )
         shard_dims.update((param, p.dim) for param, p in placements.items())
         if moe is None or expert_mesh is None:
-            add_module_bucket([block_fqn], reshard_after_forward)
+            block_buckets.append(
+                [add_module_bucket([block_fqn], reshard_after_forward)]
+            )
             continue
         # Parameter-name buckets hook the deepest module holding their params:
         # the block for the dense bucket, the routed experts for the other.
@@ -191,8 +200,10 @@ def apply_flex_shard_to_decoder(
             fqns = expert_fqns if param in experts else dense_fqns
             fqns.append(param_fqns[param])
         bucketed_params.update(transformer_block.parameters())
-        add_bucket(dense_fqns, reshard_after_forward)
-        add_bucket(expert_fqns, reshard_after_forward, mesh=expert_mesh)
+        dense_bucket = add_bucket(dense_fqns, reshard_after_forward)
+        expert_bucket = add_bucket(expert_fqns, reshard_after_forward, mesh=expert_mesh)
+        block_buckets.append([dense_bucket, expert_bucket])
+        expert_buckets.append(expert_bucket)
     # fully_shard(model) puts the remaining parameters in the root group, which
     # FSDP2 does not reshard after forward.
     root_fqns = [
@@ -202,7 +213,61 @@ def apply_flex_shard_to_decoder(
         add_bucket(root_fqns, reshard_after_forward=False)
 
     flex_shard(model, buckets=buckets)
+    if ep_degree > 1:
+        _set_explicit_prefetch(
+            # One bucket storage per BucketSpec, all of which name parameters.
+            # pyrefly: ignore [bad-argument-type]
+            model.sharded_bucket_storages,
+            embedding_bucket=embedding_bucket,
+            block_buckets=block_buckets,
+            head_bucket=head_bucket,
+            expert_buckets=expert_buckets,
+        )
     logger.info("Applied FlexShard to the model")
+
+
+def _set_explicit_prefetch(
+    storages: list,
+    *,
+    embedding_bucket: int | None,
+    block_buckets: list[list[int]],
+    head_bucket: int | None,
+    expert_buckets: list[int],
+) -> None:
+    """Set the explicit prefetch ``apply_fsdp_to_decoder`` sets with expert
+    parallelism, whose device-to-host syncs keep the CPU from issuing the next
+    all-gathers early.
+
+    In forward, the embedding prefetches the first block, and each block the
+    next, the last one the norm with the output projection; in backward, the
+    output projection prefetches the last block, and each block the previous
+    one, the first one the embedding. A block prefetches from its first bucket,
+    which hooks the block, and prefetches all its buckets. Its expert bucket,
+    whose group FSDP2 unshards with the block, prefetches nothing.
+    """
+
+    def block(idx: int) -> list:
+        return [storages[bucket] for bucket in block_buckets[idx]]
+
+    for bucket in expert_buckets:
+        storages[bucket].set_buckets_to_forward_prefetch([])
+        storages[bucket].set_buckets_to_backward_prefetch([])
+    if embedding_bucket is not None and block_buckets:
+        storages[embedding_bucket].set_buckets_to_forward_prefetch(block(0))
+    if head_bucket is not None and block_buckets:
+        storages[head_bucket].set_buckets_to_backward_prefetch(block(-1))
+    for idx, buckets in enumerate(block_buckets):
+        first = storages[buckets[0]]
+        if idx + 1 < len(block_buckets):
+            first.set_buckets_to_forward_prefetch(block(idx + 1))
+        elif head_bucket is not None:
+            first.set_buckets_to_forward_prefetch([storages[head_bucket]])
+        else:
+            first.set_buckets_to_forward_prefetch([])
+        if idx > 0:
+            first.set_buckets_to_backward_prefetch(block(idx - 1))
+        elif embedding_bucket is not None:
+            first.set_buckets_to_backward_prefetch([storages[embedding_bucket]])
 
 
 def as_fsdp2_dtensor(param: torch.Tensor) -> torch.Tensor:
