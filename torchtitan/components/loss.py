@@ -676,8 +676,10 @@ class ChunkedLossWrapper(BaseLoss):
             # gradient synchronization into one reduce-scatter at the final chunk
             # by disabling it for chunks 0..N-2.
             if fsdp_group is not None:
-                reshard_after_forward = fsdp_group.reshard_after_forward
-                reshard_after_backward = fsdp_group.reshard_after_backward
+                reshard_settings = (
+                    fsdp_group.reshard_after_forward,
+                    fsdp_group.reshard_after_backward,
+                )
                 fsdp_group.set_reshard_after_forward(False)
                 fsdp_group.set_reshard_after_backward(False)
                 fsdp_group.set_requires_gradient_sync(False)
@@ -735,6 +737,8 @@ class ChunkedLossWrapper(BaseLoss):
                             h_chunk.grad = None
 
             if fsdp_group is not None:
+                # pyrefly: ignore [unbound-name]
+                reshard_after_forward, reshard_after_backward = reshard_settings
                 fsdp_group.set_reshard_after_forward(reshard_after_forward)
                 fsdp_group.set_reshard_after_backward(reshard_after_backward)
                 fsdp_group.reshard()
