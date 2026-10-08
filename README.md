@@ -64,11 +64,11 @@ Requirements:
   [pytorch/pytorch#200179](https://github.com/pytorch/pytorch/pull/200179). Any
   nightly from 2.16.0.dev20261009 on has both.
 - FlexShard with meta-pytorch/flex_shard#51 through
-  [#58](https://github.com/meta-pytorch/flex_shard/pull/58), until they land:
+  [#59](https://github.com/meta-pytorch/flex_shard/pull/59), until they land:
 
   ```bash
   pip install torchao
-  pip install --no-deps "git+https://github.com/meta-pytorch/flex_shard.git@gh/weifengpy/48/head"
+  pip install --no-deps "git+https://github.com/meta-pytorch/flex_shard.git@gh/weifengpy/49/head"
   ```
 
 Download the tokenizer:
@@ -115,9 +115,13 @@ PYTHONPATH=. python scripts/loss_compare.py . . \
 
 The flex_shard backend shards over `data_parallel_shard_degree` only, with
 expert parallelism. It supports activation checkpointing, local compile
-regions, FlexAttention and the chunked loss. It doesn't yet support:
+regions, FlexAttention, the chunked loss, and checkpointing with
+`CheckpointManager`, whose checkpoints load across the two backends. It doesn't
+yet support:
 
-- checkpointing, CUDA graphs, CPU offload, EMA, DistMuon and SPMD type checking;
+- CUDA graphs, CPU offload, EMA, DistMuon and SPMD type checking;
+- Hugging Face checkpoint conversion, `async_with_pinned_mem` checkpointing and
+  the `torch_checkpointing` checkpointer;
 - replicated data parallelism, and tensor, context or pipeline parallelism.
 
 ## License
