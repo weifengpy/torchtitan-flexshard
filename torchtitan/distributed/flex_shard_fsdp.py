@@ -52,7 +52,7 @@ _EXPERT_STORAGE_MESHES: dict[DeviceMesh, DeviceMesh] = {}
 
 def apply_flex_shard_to_decoder(
     model: "Decoder",
-    dp_mesh: DeviceMesh,
+    storage_mesh: DeviceMesh,
     *,
     param_dtype: torch.dtype,
     reduce_dtype: torch.dtype,
@@ -69,15 +69,20 @@ def apply_flex_shard_to_decoder(
     left to the root group. Gradients are summed without division, as
     ``disable_fsdp_gradient_division`` makes FSDP2 do.
 
+    Buckets shard over ``storage_mesh``'s ``dp_shard`` axis. With context
+    parallelism they shard over ``dp_shard`` and ``cp``, flattened as
+    ``fully_shard`` flattens several shard axes.
+
     With expert parallelism, ``fully_shard`` splits an MoE block into two
     groups: the routed experts on ``edp_mesh``'s ``edp_shard`` axis, and the
-    rest of the block on ``dp_mesh``. The block then gets a bucket for each.
+    rest of the block on the dense mesh. The block then gets a bucket for each.
     The routed experts first declare which experts each ep rank holds, so that
     FlexShard's checkpoint layouts cover every ep rank's experts.
 
     Args:
         model: The decoder to shard.
-        dp_mesh: The 1D ``dp_shard`` mesh to shard over.
+        storage_mesh: The dense storage mesh from ``resolve_fsdp_mesh``, with the
+            ``dp_shard`` axis, and ``cp`` under context parallelism.
         param_dtype: The dtype of the unsharded parameters.
         reduce_dtype: The dtype of gradient reduction.
         pp_enabled: Whether pipeline parallelism is enabled.
@@ -94,10 +99,16 @@ def apply_flex_shard_to_decoder(
     # pyrefly: ignore [missing-import]
     from flex_shard.custom_placements.shard import Shard as FlexShardShard
 
-    if dp_mesh.mesh_dim_names != ("dp_shard",):
+    mesh_axis_names = storage_mesh.mesh_dim_names
+    if mesh_axis_names == ("dp_shard",):
+        dp_mesh = storage_mesh
+    elif mesh_axis_names == ("dp_shard", "cp"):
+        # The flattened mesh fully_shard creates for these shard axes.
+        dp_mesh = storage_mesh["dp_shard", "cp"]._flatten("dp_shard_cp")
+    else:
         raise ValueError(
-            "FlexShard shards over a 1D mesh with the dp_shard axis, but got "
-            f"mesh axes {dp_mesh.mesh_dim_names}."
+            "FlexShard shards over the dp_shard axis, with cp under context "
+            f"parallelism, but got mesh axes {mesh_axis_names}."
         )
     expert_mesh = None
     if ep_degree > 1:
