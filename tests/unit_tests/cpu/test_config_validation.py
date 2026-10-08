@@ -134,12 +134,13 @@ def test_flex_shard_rejects_features_it_lacks() -> None:
     config.parallelism = ParallelismConfig(fsdp_backend="flex_shard")
 
     with _cuda_graphs_supported(True), pytest.raises(
-        ValueError, match=r"does not support CUDA graphs .*, ChunkedLossWrapper yet"
+        ValueError,
+        match=r"does not support CUDA graphs \(set training\.disable_cuda_graphs\) yet",
     ):
         TrainingEngine.Config.__post_init__(config)
 
+    # The recipe's ChunkedLossWrapper stays.
     config.training.disable_cuda_graphs = True
-    config.loss = config.loss.loss_fn  # the chunked wrapper's cross-entropy
     with _cuda_graphs_supported(True):
         TrainingEngine.Config.__post_init__(config)
 

@@ -6,7 +6,7 @@
 
 import logging
 from collections.abc import Callable
-from typing import Any, cast, TYPE_CHECKING
+from typing import Any, cast, Protocol, TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -134,6 +134,79 @@ def get_fsdp_reshard_settings(module: FSDPModule) -> tuple[bool, bool]:
     }
     assert len(settings) == 1, f"Expected one reshard setting, got {settings}"
     return settings.pop()
+
+
+class FSDPGroup(Protocol):
+    """The calls on one group of jointly sharded parameters, e.g. lm_head's,
+    that code serving both FSDP backends makes: FSDP2's per-module methods,
+    which a FlexShard bucket storage also has, and getters for the reshard
+    settings."""
+
+    @property
+    def reshard_after_forward(self) -> bool:
+        ...
+
+    @property
+    def reshard_after_backward(self) -> bool:
+        ...
+
+    def set_reshard_after_forward(self, reshard_after_forward: bool) -> None:
+        ...
+
+    def set_reshard_after_backward(self, reshard_after_backward: bool) -> None:
+        ...
+
+    def set_requires_gradient_sync(self, requires_gradient_sync: bool) -> None:
+        ...
+
+    def unshard(self) -> None:
+        ...
+
+    def reshard(self) -> None:
+        ...
+
+
+class FSDPModuleGroup:
+    """An ``FSDPModule``'s ``fully_shard`` group as an ``FSDPGroup``."""
+
+    def __init__(self, module: FSDPModule) -> None:
+        self.module = module
+
+    @property
+    def reshard_after_forward(self) -> bool:
+        return get_fsdp_reshard_settings(self.module)[0]
+
+    @property
+    def reshard_after_backward(self) -> bool:
+        return get_fsdp_reshard_settings(self.module)[1]
+
+    def set_reshard_after_forward(self, reshard_after_forward: bool) -> None:
+        self.module.set_reshard_after_forward(reshard_after_forward)
+
+    def set_reshard_after_backward(self, reshard_after_backward: bool) -> None:
+        self.module.set_reshard_after_backward(reshard_after_backward)
+
+    def set_requires_gradient_sync(self, requires_gradient_sync: bool) -> None:
+        self.module.set_requires_gradient_sync(requires_gradient_sync, recurse=False)
+
+    def unshard(self) -> None:
+        self.module.unshard()
+
+    def reshard(self) -> None:
+        self.module.reshard()
+
+
+def get_fsdp_group(model: nn.Module, module: nn.Module) -> FSDPGroup | None:
+    """Return the group that shards ``module``'s parameters in ``model``, or
+    None if FSDP does not shard them: ``module``'s ``fully_shard`` group with
+    FSDP2, its parameters' bucket storage with FlexShard."""
+    if isinstance(module, FSDPModule):
+        return FSDPModuleGroup(module)
+    # FlexShard's root module finds the bucket of a parameter.
+    if hasattr(model, "bucket_storage_of"):
+        # pyrefly: ignore [not-callable]
+        return model.bucket_storage_of(next(module.parameters()))
+    return None
 
 
 def require_fsdp2_backend(parallelism: ParallelismConfig, model_name: str) -> None:
