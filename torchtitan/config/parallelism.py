@@ -76,8 +76,8 @@ class ParallelismConfig:
     Which library shards parameters over ``dp_shard``. "fsdp2" applies PyTorch's
     ``fully_shard``. "flex_shard" applies FlexShard (meta-pytorch/flex_shard),
     with one ``fsdp2_compatible`` bucket per FSDP2 group, so training is bitwise
-    identical to "fsdp2". FlexShard does not support HSDP, tensor, context,
-    expert or pipeline parallelism, or symmetric-memory communication yet.
+    identical to "fsdp2". FlexShard does not support HSDP, tensor, context or
+    pipeline parallelism, or symmetric-memory communication yet.
     """
 
     tensor_parallel_degree: int = 1
@@ -259,7 +259,6 @@ class ParallelismConfig:
                     ),
                     ("tensor_parallel_degree", self.tensor_parallel_degree),
                     ("context_parallel_degree", self.context_parallel_degree),
-                    ("expert_parallel_degree", self.expert_parallel_degree),
                     ("pipeline_parallel_degree", self.pipeline_parallel_degree),
                 )
                 if degree != 1
@@ -270,9 +269,9 @@ class ParallelismConfig:
                 )
             if unsupported:
                 raise ValueError(
-                    "parallelism.fsdp_backend='flex_shard' shards over "
-                    "data_parallel_shard_degree only so far; it does not support "
-                    f"{', '.join(unsupported)}."
+                    "parallelism.fsdp_backend='flex_shard' supports only data "
+                    "parallelism over data_parallel_shard_degree, with expert "
+                    f"parallelism, so far; it does not support {', '.join(unsupported)}."
                 )
         if self.fsdp_symm_mem_scope is not None and (
             not torch.cuda.is_available()

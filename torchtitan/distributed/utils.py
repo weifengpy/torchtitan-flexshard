@@ -584,6 +584,8 @@ def _clip_grad_norm_with_ep(
     foreach: bool | None,
     pp_mesh: DeviceMesh | None,
 ) -> torch.Tensor:
+    from torchtitan.distributed.flex_shard_fsdp import grads_for_norm
+
     ep_params = []
     non_ep_params = []
     ep_grads = []
@@ -592,15 +594,16 @@ def _clip_grad_norm_with_ep(
     for p in parameters:
         if p.grad is None:
             continue
-        assert isinstance(p, DTensor) and isinstance(p.grad, DTensor)
-        mesh_dim_names = p.device_mesh.mesh_dim_names
+        (grad,) = grads_for_norm([p])
+        assert isinstance(grad, DTensor)
+        mesh_dim_names = grad.device_mesh.mesh_dim_names
         assert mesh_dim_names is not None
         if "ep" in mesh_dim_names:
             ep_params.append(p)
-            ep_grads.append(p.grad)
+            ep_grads.append(grad)
         else:
             non_ep_params.append(p)
-            non_ep_grads.append(p.grad)
+            non_ep_grads.append(grad)
 
     # Either list can be empty depending on the parallelization strategy:
     # - In torchtitan with separate dense/sparse meshes, both lists are typically non-empty
