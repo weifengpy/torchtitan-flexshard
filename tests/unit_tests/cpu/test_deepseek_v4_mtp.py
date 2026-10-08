@@ -65,6 +65,7 @@ class TestDeepSeekV4MTPConfig(unittest.TestCase):
             enable_cpu_offload=False,
         )
         parallelism = SimpleNamespace(
+            fsdp_backend="fsdp2",
             fsdp_reshard_after_forward="default",
             fsdp_symm_mem_scope=None,
         )
