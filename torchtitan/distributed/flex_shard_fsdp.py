@@ -72,6 +72,8 @@ def apply_flex_shard_to_decoder(
     With expert parallelism, ``fully_shard`` splits an MoE block into two
     groups: the routed experts on ``edp_mesh``'s ``edp_shard`` axis, and the
     rest of the block on ``dp_mesh``. The block then gets a bucket for each.
+    The routed experts first declare which experts each ep rank holds, so that
+    FlexShard's checkpoint layouts cover every ep rank's experts.
 
     Args:
         model: The decoder to shard.
@@ -107,6 +109,7 @@ def apply_flex_shard_to_decoder(
             )
         expert_mesh = edp_mesh["edp_shard"]
         _EXPERT_STORAGE_MESHES[expert_mesh] = edp_mesh
+        _declare_spmd_global_layouts(model, edp_mesh)
     reshard_after_forward = get_fsdp_reshard_after_forward_policy(
         reshard_after_forward_policy, pp_enabled
     )
@@ -224,6 +227,29 @@ def apply_flex_shard_to_decoder(
             expert_buckets=expert_buckets,
         )
     logger.info("Applied FlexShard to the model")
+
+
+def _declare_spmd_global_layouts(model: nn.Module, mesh: DeviceMesh) -> None:
+    """Declare where each parameter sits in its full parameter, from the SPMD
+    layouts ``Module._parallelize`` records in each module's ``_sharding_config``.
+
+    ``_parallelize`` leaves routed experts as each ep rank's plain local shard
+    of the experts' dim 0. Declared before ``flex_shard``, the layout composes
+    with FlexShard's own split over ``edp_shard``, so checkpoints describe the
+    experts of every ep rank. Axes absent from ``mesh`` count as size 1.
+    """
+    # pyrefly: ignore [missing-import]
+    from flex_shard.layout_adapters.spmd_types import spmd_types_to_global_layout
+
+    layouts = {}
+    for module_fqn, module in model.named_modules():
+        sharding_config = getattr(module, "_sharding_config", None)
+        if sharding_config is None:
+            continue
+        prefix = f"{module_fqn}." if module_fqn else ""
+        for name, layout in sharding_config.state_shardings.items():
+            layouts[f"{prefix}{name}"] = layout
+    spmd_types_to_global_layout(model, layouts, mesh)
 
 
 def _set_explicit_prefetch(

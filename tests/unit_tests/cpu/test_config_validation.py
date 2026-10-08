@@ -9,6 +9,10 @@ from unittest import mock
 
 import pytest
 
+from torchtitan.components.checkpointer import CheckpointManager
+from torchtitan.components.checkpointer.torch_checkpointing import (
+    TorchCheckpointingManager,
+)
 from torchtitan.components.validate import Validator
 from torchtitan.config import DebugConfig, ParallelismConfig, TrainingConfig
 from torchtitan.models.common.token_dispatcher import HybridEPTokenDispatcher
@@ -143,6 +147,44 @@ def test_flex_shard_rejects_features_it_lacks() -> None:
     config.training.disable_cuda_graphs = True
     with _cuda_graphs_supported(True):
         TrainingEngine.Config.__post_init__(config)
+
+
+def test_flex_shard_checkpointing() -> None:
+    config = llama3_debugmodel()
+    config.parallelism = ParallelismConfig(fsdp_backend="flex_shard")
+    config.training.disable_cuda_graphs = True
+
+    for checkpointer in (
+        CheckpointManager.Config(),
+        CheckpointManager.Config(async_mode="async"),
+        CheckpointManager.Config(export_dtype="bfloat16"),
+    ):
+        config.checkpointer = checkpointer
+        TrainingEngine.Config.__post_init__(config)
+
+    for checkpointer, match in (
+        (
+            CheckpointManager.Config(async_mode="async_with_pinned_mem"),
+            r"async_with_pinned_mem', whose checkpoint process drops",
+        ),
+        (
+            CheckpointManager.Config(last_save_in_hf=True),
+            "Hugging Face checkpoints",
+        ),
+        (
+            CheckpointManager.Config(
+                initial_load_in_hf=True, initial_load_path="/checkpoint"
+            ),
+            "Hugging Face checkpoints",
+        ),
+        (
+            TorchCheckpointingManager.Config(),
+            "checkpointers other than CheckpointManager",
+        ),
+    ):
+        config.checkpointer = checkpointer
+        with pytest.raises(ValueError, match=match):
+            TrainingEngine.Config.__post_init__(config)
 
 
 def test_spmd_typechecking_rejects_pipeline_parallelism() -> None:

@@ -284,6 +284,8 @@ class CheckpointManager(BaseCheckpointManager):
         """
 
         ret: Future | AsyncSaveResponse | None = None
+        # The last save's export_dtype cast creates new tensors.
+        self._set_flex_shard_global_layouts(state_dict)
 
         storage_writer: HuggingFaceStorageWriter | None = None
         fqn_to_index_mapping: dict[Any, int] | None = None
@@ -605,7 +607,25 @@ class CheckpointManager(BaseCheckpointManager):
         sd = {k: v for k, v in states.items() if k != MODEL}
         if MODEL in states:
             sd.update(states[MODEL].state_dict())
+            # A load replaces ModelWrapper's cached tensors.
+            self._set_flex_shard_global_layouts(sd)
         return sd
+
+    def _set_flex_shard_global_layouts(self, state_dict: dict[str, Any]) -> None:
+        """Declare where each FlexShard parameter's local shard sits in the full
+        parameter, on the model tensors of ``state_dict``.
+
+        FlexShard parameters are plain local shards, which DCP would otherwise
+        save as full tensors. The layouts are attributes of the state dict's
+        tensor objects, so every state dict passed to DCP declares them.
+        """
+        for model in self.states[MODEL].model:
+            # FlexShard's root module finds the bucket of a parameter.
+            if hasattr(model, "bucket_storage_of"):
+                # pyrefly: ignore [missing-import]
+                from flex_shard import set_state_dict_global_layouts
+
+                set_state_dict_global_layouts(model, state_dict)
 
     def _save_last_step(self, curr_step: int) -> None:
         """Execute the final checkpoint save at the completion of training.

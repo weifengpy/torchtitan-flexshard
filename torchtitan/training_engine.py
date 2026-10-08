@@ -172,7 +172,33 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                             not self.training.disable_cuda_graphs
                             and cuda_graphs_supported(),
                         ),
-                        ("checkpointing", self.checkpointer is not None),
+                        (
+                            "checkpointers other than CheckpointManager, such as "
+                            "torch_checkpointing's, whose resharder ignores "
+                            "FlexShard's shard layouts",
+                            self.checkpointer is not None
+                            and not isinstance(
+                                self.checkpointer, CheckpointManager.Config
+                            ),
+                        ),
+                        (
+                            "checkpointer.async_mode='async_with_pinned_mem', "
+                            "whose checkpoint process drops FlexShard's shard "
+                            "layouts",
+                            isinstance(self.checkpointer, CheckpointManager.Config)
+                            and self.checkpointer.async_mode
+                            == "async_with_pinned_mem",
+                        ),
+                        (
+                            "Hugging Face checkpoints (checkpointer."
+                            "initial_load_in_hf or last_save_in_hf), whose "
+                            "conversion needs full tensors",
+                            self.checkpointer is not None
+                            and (
+                                self.checkpointer.initial_load_in_hf
+                                or self.checkpointer.last_save_in_hf
+                            ),
+                        ),
                         ("optim.ema", self.optim.ema is not None),
                         (
                             "DistMuon, which needs DTensor parameters",
@@ -188,7 +214,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                 if unsupported:
                     raise ValueError(
                         "parallelism.fsdp_backend='flex_shard' does not support "
-                        f"{', '.join(unsupported)} yet."
+                        f"{'; '.join(unsupported)} yet."
                     )
             if self.optim.enable_cuda_graph and self.training.disable_cuda_graphs:
                 raise ValueError(
