@@ -122,6 +122,20 @@ def set_requires_gradient_sync(
     model_part.set_requires_gradient_sync(requires_gradient_sync)
 
 
+def get_fsdp_reshard_settings(module: FSDPModule) -> tuple[bool, bool]:
+    """Return ``module``'s ``(reshard_after_forward, reshard_after_backward)``.
+
+    ``FSDPModule`` has setters for both, which set each of its parameter groups,
+    but no getters, so this reads the groups.
+    """
+    settings = {
+        (group._reshard_after_forward, group.reshard_after_backward)
+        for group in module._get_fsdp_state()._fsdp_param_groups
+    }
+    assert len(settings) == 1, f"Expected one reshard setting, got {settings}"
+    return settings.pop()
+
+
 def require_fsdp2_backend(parallelism: ParallelismConfig, model_name: str) -> None:
     """Reject ``parallelism.fsdp_backend='flex_shard'`` for a model that has no
     FlexShard path yet."""
