@@ -187,7 +187,9 @@ def apply_flex_shard_to_decoder(
             )
         shard_dims.update((param, p.dim) for param, p in placements.items())
         if moe is None or expert_mesh is None:
-            block_buckets.append([add_module_bucket([block_fqn], reshard_after_forward)])
+            block_buckets.append(
+                [add_module_bucket([block_fqn], reshard_after_forward)]
+            )
             continue
         # Parameter-name buckets hook the deepest module holding their params:
         # the block for the dense bucket, the routed experts for the other.
@@ -214,7 +216,7 @@ def apply_flex_shard_to_decoder(
     if ep_degree > 1:
         _set_explicit_prefetch(
             # One bucket storage per BucketSpec, all of which name parameters.
-            # pyrefly: ignore [missing-attribute]
+            # pyrefly: ignore [bad-argument-type]
             model.sharded_bucket_storages,
             embedding_bucket=embedding_bucket,
             block_buckets=block_buckets,
