@@ -74,8 +74,11 @@ class MultimodalModel(Decoder):
     ) -> None:
         from torchtitan.distributed.fsdp import (
             apply_fsdp_to_multimodal_encoder,
+            require_fsdp2_backend,
             resolve_fsdp_mesh,
         )
+
+        require_fsdp2_backend(parallelism, "multimodal models")
 
         if not parallelism_context.pp_enabled:
             dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallelism_context)
