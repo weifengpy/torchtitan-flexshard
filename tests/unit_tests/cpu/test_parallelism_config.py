@@ -97,7 +97,6 @@ def test_parallelism_config_rejects_unknown_fsdp_backend() -> None:
     "kwargs",
     [
         {"data_parallel_replicate_degree": 2},
-        {"tensor_parallel_degree": 2},
         {"pipeline_parallel_degree": 2},
         {"fsdp_symm_mem_scope": "all"},
     ],
@@ -114,3 +113,18 @@ def test_flex_shard_supports_expert_parallelism() -> None:
 
 def test_flex_shard_supports_context_parallelism() -> None:
     ParallelismConfig(fsdp_backend="flex_shard", context_parallel_degree=2)
+
+
+def test_flex_shard_supports_tensor_parallelism() -> None:
+    ParallelismConfig(fsdp_backend="flex_shard", tensor_parallel_degree=2)
+
+
+def test_flex_shard_rejects_tensor_and_context_parallelism_together() -> None:
+    with pytest.raises(
+        ValueError, match="does not support tensor and context parallelism together"
+    ):
+        ParallelismConfig(
+            fsdp_backend="flex_shard",
+            tensor_parallel_degree=2,
+            context_parallel_degree=2,
+        )
