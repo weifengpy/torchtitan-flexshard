@@ -24,6 +24,9 @@ from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.distributed.fsdp import set_requires_gradient_sync
 from torchtitan.distributed.parallelism_context import ParallelismContext
+from torchtitan.models.deepseek_v3 import (
+    build_model_config as build_deepseek_v3_model_config,
+)
 from torchtitan.models.llama3 import build_model_config
 
 flex_shard = pytest.importorskip("flex_shard")
@@ -48,13 +51,15 @@ class TestFlexShardDecoder(DTensorTestBase):
         fsdp_backend: str,
         reshard_after_forward: str,
         parallelism_context: ParallelismContext,
+        build_config=build_model_config,
     ):
         parallelism = ParallelismConfig(
             data_parallel_shard_degree=self.world_size,
+            expert_parallel_degree=parallelism_context.ep,
             fsdp_backend=fsdp_backend,
             fsdp_reshard_after_forward=reshard_after_forward,
         )
-        model_config = build_model_config("debugmodel", seq_len=_SEQ_LEN)
+        model_config = build_config("debugmodel", seq_len=_SEQ_LEN)
         model_config.set_sharding_(parallelism)
         with parallelism_context.activate_spmd(), torch.device("meta"):
             model = model_config.build()
@@ -105,6 +110,13 @@ class TestFlexShardDecoder(DTensorTestBase):
                     parallelism=parallelism,
                     max_context_length=_SEQ_LEN,
                 )
+                if "aux_loss_denominators" in model_kwargs:
+                    # The trainer's global routed-token count: no padding, so
+                    # every token of every microbatch on every rank.
+                    model_kwargs["aux_loss_denominators"] = torch.tensor(
+                        [_SEQ_LEN * self.world_size * microbatches],
+                        device=self.device_type,
+                    )
                 with parallelism_context.activate_spmd():
                     logits = model(inputs, **model_kwargs)
                     loss = F.cross_entropy(logits.float(), labels)
@@ -112,7 +124,10 @@ class TestFlexShardDecoder(DTensorTestBase):
                         loss.backward()
                 losses.append(loss.detach())
             grad_norm = dist_utils.clip_grad_norm_(
-                list(model.parameters()), max_norm=1.0, foreach=True
+                list(model.parameters()),
+                max_norm=1.0,
+                foreach=True,
+                ep_enabled=parallelism_context.ep_enabled,
             )
             grads = {
                 fqn: _local(param.grad).clone()
@@ -137,31 +152,19 @@ class TestFlexShardDecoder(DTensorTestBase):
                 torch.equal(expected_tensor, actual[fqn]), msg=f"{context} {fqn}"
             )
 
-    @with_comms
-    def test_matches_fsdp2(self):
-        # One context, as in training: both backends shard over its dp_shard mesh.
-        parallelism_context = ParallelismContext(
-            dp_replicate=1,
-            dp_shard=self.world_size,
-            cp=1,
-            tp=1,
-            pp=1,
-            ep=1,
-            world_size=self.world_size,
-            enable_sequence_parallel=False,
-        )
-        for reshard_after_forward, microbatches in product(
-            ("default", "always"), (1, 2)
-        ):
+    def _check_matches_fsdp2(
+        self, parallelism_context, configs, build_config=build_model_config
+    ) -> None:
+        for reshard_after_forward, microbatches in configs:
             context = (
                 f"reshard_after_forward={reshard_after_forward} "
                 f"microbatches={microbatches}"
             )
             fsdp2, *fsdp2_setup = self._build(
-                "fsdp2", reshard_after_forward, parallelism_context
+                "fsdp2", reshard_after_forward, parallelism_context, build_config
             )
             flex, *flex_setup = self._build(
-                "flex_shard", reshard_after_forward, parallelism_context
+                "flex_shard", reshard_after_forward, parallelism_context, build_config
             )
             for fqn, param in flex.named_parameters():
                 self.assertTrue(flex_shard.is_flex_shard_param(param), msg=fqn)
@@ -190,3 +193,40 @@ class TestFlexShardDecoder(DTensorTestBase):
                 self._assert_equal_tensors(
                     expected[3], actual[3], f"{step_context} param"
                 )
+
+    @with_comms
+    def test_matches_fsdp2(self):
+        # One context, as in training: both backends shard over its dp_shard mesh.
+        parallelism_context = ParallelismContext(
+            dp_replicate=1,
+            dp_shard=self.world_size,
+            cp=1,
+            tp=1,
+            pp=1,
+            ep=1,
+            world_size=self.world_size,
+            enable_sequence_parallel=False,
+        )
+        self._check_matches_fsdp2(
+            parallelism_context, product(("default", "always"), (1, 2))
+        )
+
+    @with_comms
+    def test_matches_fsdp2_with_expert_parallelism(self):
+        # Routed experts shard over edp_shard (2 ranks per ep shard), the rest
+        # of each MoE block over dp_shard.
+        parallelism_context = ParallelismContext(
+            dp_replicate=1,
+            dp_shard=self.world_size,
+            cp=1,
+            tp=1,
+            pp=1,
+            ep=2,
+            world_size=self.world_size,
+            enable_sequence_parallel=False,
+        )
+        self._check_matches_fsdp2(
+            parallelism_context,
+            [("default", 1), ("default", 2)],
+            build_deepseek_v3_model_config,
+        )
