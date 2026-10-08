@@ -186,8 +186,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                             "whose checkpoint process drops FlexShard's shard "
                             "layouts",
                             isinstance(self.checkpointer, CheckpointManager.Config)
-                            and self.checkpointer.async_mode
-                            == "async_with_pinned_mem",
+                            and self.checkpointer.async_mode == "async_with_pinned_mem",
                         ),
                         (
                             "Hugging Face checkpoints (checkpointer."
