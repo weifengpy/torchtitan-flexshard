@@ -518,7 +518,8 @@ class ChunkedLossWrapper(BaseLoss):
     FSDP2 composability:
         The lm_head's FSDP reshard-after-forward and reshard-after-backward are
         temporarily disabled during the chunked loop so that the weight stays
-        unsharded across all outputs and chunks (avoiding repeated all-gathers).
+        unsharded across all outputs and chunks (avoiding repeated all-gathers),
+        and restored after it.
         Gradient synchronization remains disabled until the final chunk, so one
         reduce-scatter processes the accumulated lm_head parameter gradients.
 
@@ -654,10 +655,19 @@ class ChunkedLossWrapper(BaseLoss):
 
             fsdp_enabled = isinstance(lm_head, FSDPModule)
             # Disable FSDP reshard on lm_head to keep its weight unsharded across
-            # all outputs and chunks, avoiding repeated all-gathers. Coalesce
+            # all outputs and chunks, avoiding repeated all-gathers, then restore
+            # the reshard settings: forcing them on would make an lm_head group
+            # that skips reshard after forward (the default policy's) reshard at
+            # every later forward's end and all-gather again below. Coalesce
             # gradient synchronization into one reduce-scatter at the final chunk
             # by disabling it for chunks 0..N-2.
             if fsdp_enabled:
+                from torchtitan.distributed.fsdp import get_fsdp_reshard_settings
+
+                (
+                    reshard_after_forward,
+                    reshard_after_backward,
+                ) = get_fsdp_reshard_settings(lm_head)
                 lm_head.set_reshard_after_forward(False)
                 lm_head.set_reshard_after_backward(False)
                 lm_head.set_requires_gradient_sync(False, recurse=False)
@@ -717,8 +727,8 @@ class ChunkedLossWrapper(BaseLoss):
                             h_chunk.grad = None
 
             if fsdp_enabled:
-                lm_head.set_reshard_after_forward(True)
-                lm_head.set_reshard_after_backward(True)
+                lm_head.set_reshard_after_forward(reshard_after_forward)
+                lm_head.set_reshard_after_backward(reshard_after_backward)
                 lm_head.reshard()
             if not requires_grad:
                 return total_loss, metrics

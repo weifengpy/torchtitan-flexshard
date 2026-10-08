@@ -4,6 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
+import tempfile
 import unittest
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -1045,8 +1047,14 @@ class TestChunkedLossWrapper(unittest.TestCase):
             torch.randint(0, 8, (4,)),
         )
 
-        with patch(
-            "torch.distributed._composable.fsdp.FSDPModule", _RecordingFSDPLinear
+        with (
+            patch(
+                "torch.distributed._composable.fsdp.FSDPModule", _RecordingFSDPLinear
+            ),
+            patch(
+                "torchtitan.distributed.fsdp.get_fsdp_reshard_settings",
+                return_value=(True, True),
+            ),
         ):
             chunked_loss(predictions, labels)
 
@@ -1083,13 +1091,28 @@ class TestChunkedLossWrapper(unittest.TestCase):
         hidden_states = torch.randn(4, 4)
         labels = torch.randint(0, 8, (4,))
 
-        with patch("torch.distributed._composable.fsdp.FSDPModule", FakeFSDPLinear):
+        with (
+            patch("torch.distributed._composable.fsdp.FSDPModule", FakeFSDPLinear),
+            patch(
+                "torchtitan.distributed.fsdp.get_fsdp_reshard_settings",
+                return_value=(False, True),
+            ),
+        ):
             chunked_loss(hidden_states, labels)
 
         self.assertEqual(events.count("unshard"), 1)
         self.assertEqual(events.count("forward"), 2)
         self.assertLess(events.index("unshard"), events.index("forward"))
         self.assertEqual(events[-1], "reshard")
+        # The settings in place before the call come back after the chunk loop.
+        self.assertEqual(
+            events[-3:],
+            [
+                "set_reshard_after_forward(False)",
+                "set_reshard_after_backward(True)",
+                "reshard",
+            ],
+        )
 
     def test_numerical_equivalence(self):
         """ChunkedLossWrapper must produce the same loss and gradients as the standard path."""
@@ -1253,6 +1276,62 @@ class TestChunkedLossWrapper(unittest.TestCase):
         loss, _ = chunked_loss(hidden_states, labels, global_loss_token_counts)
 
         torch.testing.assert_close(loss, expected_loss)
+
+
+class _SkipHeadModel(nn.Module):
+    """Linear layer, norm and lm_head; forward skips lm_head, as a Decoder with
+    ``_skip_lm_head`` does."""
+
+    def __init__(self, dim: int, vocab_size: int):
+        super().__init__()
+        self.layer = nn.Linear(dim, dim)
+        self.norm = nn.RMSNorm(dim)
+        self.lm_head = nn.Linear(dim, vocab_size, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm(self.layer(x))
+
+
+class TestChunkedLossWrapperFSDP(unittest.TestCase):
+    """ChunkedLossWrapper with real FSDP2 on a single-rank gloo group."""
+
+    def setUp(self):
+        self._store_file = tempfile.NamedTemporaryFile(delete=False)
+        dist.init_process_group(
+            backend="gloo",
+            init_method=f"file://{self._store_file.name}",
+            world_size=1,
+            rank=0,
+        )
+
+    def tearDown(self):
+        dist.destroy_process_group()
+        os.remove(self._store_file.name)
+
+    def test_restores_lm_head_reshard_settings(self):
+        from torch.distributed.fsdp import fully_shard
+
+        from torchtitan.distributed.fsdp import get_fsdp_reshard_settings
+
+        torch.manual_seed(0)
+        mesh = init_device_mesh("cpu", (1,))
+        model = _SkipHeadModel(dim=8, vocab_size=16)
+        fully_shard(model.layer, mesh=mesh)
+        # As apply_fsdp_to_decoder groups them under the default policy.
+        fully_shard([model.norm, model.lm_head], mesh=mesh, reshard_after_forward=False)
+        fully_shard(model, mesh=mesh)
+        chunked_loss = ChunkedLossWrapper(ChunkedLossWrapper.Config(num_chunks=2))
+        chunked_loss.set_lm_head(model.lm_head)
+
+        for _ in range(2):
+            pred = model(torch.randn(4, 8))
+            # Without reshard after forward, lm_head keeps its unsharded weight
+            # (a plain tensor rather than the sharded DTensor) after every
+            # forward, not only the first.
+            self.assertNotIsInstance(model.lm_head.weight, DTensor)
+            loss, _ = chunked_loss(pred, torch.randint(0, 16, (4,)))
+            self.assertEqual(get_fsdp_reshard_settings(model.lm_head), (False, True))
+            loss.backward()
 
 
 class TestChunkedLossWrapperSPMD(DTensorTestBase):
