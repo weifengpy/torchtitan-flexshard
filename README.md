@@ -1,196 +1,125 @@
-<div align="center">
+# torchtitan with FlexShard
 
-# torchtitan
+This fork of [pytorch/torchtitan](https://github.com/pytorch/torchtitan) adds
+`parallelism.fsdp_backend`, which shards a model either with FSDP2 (`"fsdp2"`,
+the default) or with [FlexShard](https://github.com/meta-pytorch/flex_shard)
+(`"flex_shard"`). Training with FlexShard is bitwise identical to training with
+FSDP2. This page compares the two.
 
-#### A PyTorch native platform for training generative AI models
+## DeepSeek V3 16B on 8 H100s
 
-[![arXiv](https://img.shields.io/badge/arXiv-2410.06511-b31b1b.svg)](https://arxiv.org/abs/2410.06511)
-[![ICLR](https://img.shields.io/badge/ICLR-2025-violet.svg)](https://iclr.cc/virtual/2025/poster/29620)
-[![devlogs](https://img.shields.io/badge/PyTorch-DevLog-DE3412.svg)](https://docs.pytorch.org/devlogs/)
-[![license](https://img.shields.io/badge/license-BSD_3--Clause-lightgrey.svg)](./LICENSE)
-[![pip](https://img.shields.io/pypi/v/torchtitan?color=blue)](https://pypi.org/project/torchtitan/)
-[![conda](https://img.shields.io/conda/vn/conda-forge/torchtitan?color=green)](https://anaconda.org/conda-forge/torchtitan)
-
-
-</div>
-
-`torchtitan` is under extensive development. To use the latest features of `torchtitan`, we recommend using the most recent PyTorch nightly.
-
-
-## Latest News
-- [2026/08] [TitanRL](torchtitan/rl) is a hackable RL stack for scaling and debugging. It reuses TorchTitan model definitions and kernels across training and vLLM generation and supports batch-invariant mode.
-- [2025/11] AMD released an [optimized fork](https://github.com/AMD-AGI/torchtitan-amd/tree/main) of `torchtitan` for AMD GPUs.
-- [2025/10] We released `torchtitan` [v0.2.0](https://github.com/pytorch/torchtitan/releases).
-- [2025/10] SkyPilot now supports `torchtitan`! See the tutorial [here](https://docs.skypilot.co/en/latest/examples/training/torchtitan.html).
-- [2025/07] We published [instructions](/torchtitan/models/README.md) on how to add a model to `torchtitan`.
-- [2025/04] Our paper was accepted by [ICLR 2025](https://iclr.cc/virtual/2025/poster/29620).
-- [2024/12] GPU MODE [lecture](https://www.youtube.com/watch?v=VYWRjcUqW6w) on torchtitan.
-- [2024/07] [Presentation](https://pytorch2024.sched.com/event/1fHn3) at PyTorch Conference 2024.
-
-
-## Overview
-
-`torchtitan` is a PyTorch native platform designed for **rapid experimentation and large-scale training** of generative AI models. As a minimal clean-room implementation of PyTorch native scaling techniques, `torchtitan` provides a flexible foundation for developers to build upon. With `torchtitan` [extension points](docs/extension.md), one can easily create custom extensions tailored to specific needs.
-
-Our mission is to accelerate innovation in the field of generative AI by empowering researchers and developers to explore new modeling architectures and infrastructure techniques.
-
-The Guiding Principles when building `torchtitan`
-* Designed to be easy to understand, use and extend for different training purposes.
-* Minimal changes to the model code when applying multi-dimensional parallelism.
-* Bias towards a clean, minimal codebase while providing basic reusable / swappable components.
-
-`torchtitan` showcases PyTorch's latest distributed training features across multiple model families. Core models include Llama 3, Qwen3 / 3.5 / 3.8, DeepSeek V3 / V4, GPT-OSS, Kimi K2.7 / K3, Muse Glimmer, and Flux.
-
-## Contributing
-
-We look forward to your contributions!
-
-* To accelerate contributions to and innovations around torchtitan, we host an [`experiments`](torchtitan/experiments) folder. New ideas should start there. To contribute, follow the [`experiments guidelines`](torchtitan/experiments/README.md).
-* For fixes and contributions to core, follow these [`guidelines`](CONTRIBUTING.md).
-
-## Test status
-
-| Hardware | Integration Tests | Unit Tests |
+| | FSDP2 | FlexShard |
 | --- | --- | --- |
-| CPU | - | [![CPU Unit Test](https://github.com/pytorch/torchtitan/actions/workflows/unit_test_cpu.yaml/badge.svg?branch=main)](https://github.com/pytorch/torchtitan/actions/workflows/unit_test_cpu.yaml?query=branch%3Amain) |
-| NVIDIA GPU | [![Integration Tests](https://github.com/pytorch/torchtitan/actions/workflows/integration_test.yaml/badge.svg?branch=main)](https://github.com/pytorch/torchtitan/actions/workflows/integration_test.yaml?query=branch%3Amain) [![H100 Tests](https://github.com/pytorch/torchtitan/actions/workflows/integration_test_h100.yaml/badge.svg?branch=main)](https://github.com/pytorch/torchtitan/actions/workflows/integration_test_h100.yaml?query=branch%3Amain) [![B200 Tests](https://github.com/pytorch/torchtitan/actions/workflows/integration_test_b200.yaml/badge.svg?branch=main)](https://github.com/pytorch/torchtitan/actions/workflows/integration_test_b200.yaml?query=branch%3Amain) | [![GPU Unit Tests](https://github.com/pytorch/torchtitan/actions/workflows/unit_test_gpu.yaml/badge.svg?branch=main)](https://github.com/pytorch/torchtitan/actions/workflows/unit_test_gpu.yaml?query=branch%3Amain) |
-| AMD GPU (ROCm) | [![Integration Tests (ROCm)](https://github.com/pytorch/torchtitan/actions/workflows/integration_test_rocm.yaml/badge.svg?branch=main)](https://github.com/pytorch/torchtitan/actions/workflows/integration_test_rocm.yaml?query=branch%3Amain) | - |
+| Throughput, tokens/s per GPU | 9,281 | 9,456 (+1.9%) |
+| TFLOPs per GPU (MFU) | 168.0 (17.0%) | 171.2 (17.3%) |
+| Peak active memory | 48.09 GiB | 48.09 GiB |
+| Peak reserved memory | 57.49 GiB | 57.43 GiB |
+| GPU time of a profiled step | 1,664 ms | 1,622 ms |
+| Exposed communication in that step | 340.5 ms | 265.0 ms |
+| Loss and grad_norm, 40 steps | | bitwise equal to FSDP2 |
 
-## Llama 3.1 training
+- `scripts/loss_compare.py --assert-equal --metrics loss,grad_norm` finds
+  loss and grad_norm identical at every one of the 40 steps.
+- Throughput, TFLOPs and MFU are medians over steps 10–40 of one run per
+  backend. The per-step ranges overlap: 9,015–9,568 tokens/s for FSDP2 and
+  8,997–9,693 for FlexShard.
+- Memory is rank 0's peak.
+- The profiled step is step 5 on rank 0. FlexShard hides more of its
+  communication:
+  - all-gathers: 30.3 vs 110.1 ms exposed;
+  - reduce-scatters: 8.6 vs 14.3 ms;
+  - expert-parallel all-to-all: 220.0 vs 235.4 ms.
 
-### Key features available
+### Configuration
 
-1. Multi-dimensional composable parallelisms
-   - [FSDP2](docs/fsdp.md) with per-parameter sharding
-   - [Tensor Parallel](https://pytorch.org/docs/stable/distributed.tensor.parallel.html) (including [async TP](https://discuss.pytorch.org/t/distributed-w-torchtitan-introducing-async-tensor-parallelism-in-pytorch/209487))
-   - [Pipeline Parallel](https://discuss.pytorch.org/t/distributed-w-torchtitan-training-with-zero-bubble-pipeline-parallelism/214420)
-   - [Context Parallel](https://discuss.pytorch.org/t/distributed-w-torchtitan-breaking-barriers-training-long-context-llms-with-1m-sequence-length-in-pytorch-using-context-parallel/215082)
-2. [Meta device](https://pytorch.org/docs/stable/meta.html) initialization
-3. Per-op selective and full activation checkpointing
-4. [Distributed checkpointing](https://discuss.pytorch.org/t/distributed-w-torchtitan-optimizing-checkpointing-efficiency-with-pytorch-dcp/211250) (including async checkpointing)
-   - [Interoperable checkpoints](docs/checkpoint.md) which can be loaded directly into [`torchtune`](https://github.com/pytorch/torchtune) for fine-tuning
-5. `torch.compile` support
-6. [Low-precision training](torchtitan/quantization/README.md) with [MXFP8](torchtitan/quantization/mxfp8/README.md) and [NVFP4](torchtitan/quantization/nvfp4/README.md)
-7. [Distributed MoE](torchtitan/models/common/dist_moe/README.md) with fused CuTe DSL dispatch, expert compute, and combine on Blackwell GPUs
-8. Supervised Fine-Tuning (SFT) with chat-formatted datasets
-9. DDP and HSDP
-10. [TorchFT](https://github.com/pytorch/torchft) integration
-11. Checkpointable data-loading, with the C4 dataset pre-configured (144M entries) and support for [custom datasets](torchtitan/components/data/README.md)
-12. Gradient accumulation, derived from `training.num_tokens_per_train_step` in the selected recipe
-13. Flexible learning rate scheduler (warmup-stable-decay)
-14. [BF16 optimizer states](torchtitan/components/optim/bf16_optimizer_states.md) for reduced memory usage
-15. Loss, GPU memory, throughput (tokens/sec), TFLOPs, and MFU displayed and logged via [Tensorboard or Weights & Biases](/docs/metrics.md)
-16. [Debugging tools](docs/debugging.md) including CPU/GPU profiling, memory profiling, Flight Recorder, etc.
-    - [Deterministic SDC replay](torchtitan/observability/silent_data_corruption.md)
-17. All options easily configured in [Python](torchtitan/config/README.md) with `--module` and `--config` CLI flags
-18. Structured logging: per-rank trace of key training phases; (see [`torchtitan/observability/structured_logger/README.md`](torchtitan/observability/structured_logger/README.md))
-19. [Helper scripts](scripts/) to
-    - download tokenizers and other Hugging Face assets (`scripts/download_hf_assets.py`)
-    - convert checkpoints between Hugging Face and DCP formats (`scripts/checkpoint_conversion/`)
-    - compare training losses across commits or configs (`scripts/loss_compare.py`)
-    - run vLLM inference with TorchTitan models (`torchtitan/rl/generate.py`)
+Both backends run the `deepseek_v3_16b` recipe with the same settings; only
+`parallelism.fsdp_backend` differs.
 
-We report [performance](benchmarks/llama3_h100_202412_torchtitan.md) on up to 512 GPUs, and verify [loss converging](docs/converging.md) correctness of various techniques.
+| Setting | Value |
+| --- | --- |
+| Hardware | 8 NVIDIA H100 GPUs, one node |
+| Model | DeepSeek V3 16B: 15.7B parameters; 27 layers, the first dense and 26 MoE; dim 2,048; multi-head latent attention; per MoE layer, 64 routed experts (top-6, sigmoid routing) and 2 shared experts; vocabulary 102,400 |
+| Data-parallel sharding | 8-way (`data_parallel_shard_degree=8`), no replication. Dense parameters are sharded over all 8 GPUs. |
+| Expert parallelism | 4-way (`expert_parallel_degree=4`; the recipe's default is 8), with the all-to-all token dispatcher. Each expert-parallel rank owns 16 of the 64 routed experts, and their parameters are sharded over a 2-GPU mesh (`edp_shard`), so each GPU stores half of them. |
+| Tensor, context, pipeline parallelism | None |
+| Sharding groups | One per FSDP2 `fully_shard` group: the embedding; the final norm with lm_head; the dense layer; and, for each MoE layer, its dense parameters on the 8-GPU mesh and its routed experts on the 2-GPU mesh. FlexShard uses `Shard` placements on the same dims as FSDP2, with FSDP2's parameter order (`fsdp2_compatible=True`). |
+| Reshard after forward | `default` policy: the embedding and transformer layers reshard after forward; the norm and lm_head group doesn't. |
+| Prefetch | FSDP2's explicit expert-parallel schedule: each layer prefetches the next in forward and the previous in backward. |
+| Mixed precision | bf16 parameters, fp32 gradient reduction; gradients are summed without division. |
+| Loss | `ChunkedLossWrapper` with 8 chunks: each GPU's 16,384 tokens go through lm_head and cross-entropy (over the full 102,400-token vocabulary) in chunks of 2,048 tokens, each with its own backward. The norm and lm_head group stays gathered across the chunks. lm_head's gradient is reduce-scattered once, at the last chunk, and the norm's in the backward through the decoder. |
+| Batch | 4 sequences of 4,096 tokens per GPU per step: 16,384 tokens per GPU and 131,072 per step, without gradient accumulation. The recipe's 16,384-token sequences ran out of memory on FSDP2 with plain cross-entropy. |
+| Activation checkpointing | Per-op selective (`SelectiveAC`) |
+| Compile | Local regions (`loss`, `fused_binary_activation`, `fp32_to_bf16_split`) and FlexAttention |
+| CUDA graphs | Off; FlexShard doesn't support them yet. |
+| Data | C4 (`allenai/c4`, streamed), with the `deepseek-ai/deepseek-moe-16b-base` tokenizer |
+| Optimizer | AdamW, learning rate 2.2e-4, warming up over all 40 steps |
+| Determinism | On, as `scripts/loss_compare.py` sets it |
 
-## Installation
+## Reproducing the DeepSeek V3 16B comparison
 
-One can directly run the source code, or install `torchtitan` from a nightly build, or a stable release.
+Requirements:
 
-### From source
+- A PyTorch build with FSDP's native collective copies, from
+  [pytorch/pytorch#197204](https://github.com/pytorch/pytorch/pull/197204) and
+  [pytorch/pytorch#200179](https://github.com/pytorch/pytorch/pull/200179). Any
+  nightly from 2.16.0.dev20261009 on has both.
+- FlexShard with meta-pytorch/flex_shard#51 through
+  [#58](https://github.com/meta-pytorch/flex_shard/pull/58), until they land:
 
-This method requires the nightly build of PyTorch, or the latest PyTorch built [from source](https://github.com/pytorch/pytorch?tab=readme-ov-file#from-source).
+  ```bash
+  pip install torchao
+  pip install --no-deps "git+https://github.com/meta-pytorch/flex_shard.git@gh/weifengpy/48/head"
+  ```
 
-```bash
-git clone https://github.com/pytorch/torchtitan
-cd torchtitan
-pip install -r requirements.txt
-```
-
-> **Note:** You can run directly from the source tree. If you need to import `torchtitan` as a package from elsewhere, install it in editable mode without re-resolving dependencies: `pip install -e . --no-deps`.
-
-`torchao` is not installed by the command above. It is only needed for the
-low-precision training recipes (MXFP8 and NVFP4), and it is deliberately
-left out so that it does not get resolved independently of the `torch` you
-already have. Install a nightly matching your accelerator build when you need
-one, replacing `cu130` to match:
-
-```bash
-USE_CPP=0 python -m pip install --pre --upgrade torchao --index-url https://download.pytorch.org/whl/nightly/cu130
-```
-
-### Nightly builds
-
-This method requires the nightly build of PyTorch. You can replace `cu130` with another version of cuda or an AMD GPU (e.g. `rocm6.3`).
-
-```sh
-pip3 install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu130 --force-reinstall
-pip install --pre torchtitan --index-url https://download.pytorch.org/whl/nightly/cu130
-```
-
-### Stable releases
-One can install the latest [stable release](https://github.com/pytorch/torchtitan/releases) of `torchtitan` via `pip` or `conda`.
-```sh
-pip install torchtitan
-```
-```sh
-conda install conda-forge::torchtitan
-```
-Note that each stable release pins the nightly versions of `torch` and `torchao`. Please see [release.md](docs/release.md) for more details.
-
-### Downloading a tokenizer
-
-`torchtitan` currently supports training Llama 3.1 (8B, 70B, 405B) out of the box. To get started training these models, we need to download the tokenizer. Follow the instructions on the official [meta-llama](https://huggingface.co/meta-llama/Llama-3.1-8B) repository to ensure you have access to the Llama model weights.
-
-Once you have confirmed access, you can run the following command to download the Llama 3.1 tokenizer to your local machine.
+Download the tokenizer:
 
 ```bash
-# Get your HF token from https://huggingface.co/settings/tokens
-
-# Llama 3.1 tokenizer
-python scripts/download_hf_assets.py --repo_id meta-llama/Llama-3.1-8B --assets tokenizer --hf_token=...
+python scripts/download_hf_assets.py --repo_id deepseek-ai/deepseek-moe-16b-base --assets tokenizer
 ```
 
-### Start a training run
-Llama 3 8B model locally on 8 GPUs
+Save the two configs as `flex_shard_16b.py`:
+
+```python
+import dataclasses
+
+from torchtitan_recipes.tests.models.deepseek_v3 import deepseek_v3_16b
+
+
+def _config(backend: str):
+    config = deepseek_v3_16b(seq_len=4096)
+    config.training.disable_cuda_graphs = True
+    config.parallelism = dataclasses.replace(
+        config.parallelism, expert_parallel_degree=4, fsdp_backend=backend
+    )
+    return config
+
+
+def fsdp2():
+    return _config("fsdp2")
+
+
+def flex_shard():
+    return _config("flex_shard")
+```
+
+Then run both backends and compare them step by step:
 
 ```bash
-MODULE=torchtitan_recipes.models.llama3 CONFIG=llama3_8b ./run_train.sh
+PYTHONPATH=. python scripts/loss_compare.py . . \
+    --baseline-module flex_shard_16b --baseline-config fsdp2 \
+    --test-config flex_shard \
+    --assert-equal --metrics loss,grad_norm --no-seed-checkpoint --steps 40
 ```
 
-### Multi-Node Training
-For training on ParallelCluster/Slurm type configurations, you can use the `multinode_trainer.slurm` file to submit your sbatch job.
+## Scope
 
-To get started adjust the number of nodes and GPUs
-```
-#SBATCH --ntasks=2
-#SBATCH --nodes=2
-```
+The flex_shard backend shards over `data_parallel_shard_degree` only, with
+expert parallelism. It supports activation checkpointing, local compile
+regions, FlexAttention and the chunked loss. It doesn't yet support:
 
-Then start a run where `nnodes` is your total node count, matching the sbatch node count above.
-
-```
-srun torchrun --nnodes 2
-```
-
-If your gpu count per node is not 8, adjust `--nproc_per_node` in the torchrun command and `#SBATCH --gpus-per-task` in the SBATCH command section.
-
-## Citation
-
-We provide a detailed look into the parallelisms and optimizations available in `torchtitan`, along with summary advice on when to use various techniques.
-
-[TorchTitan: One-stop PyTorch native solution for production ready LLM pre-training](https://openreview.net/forum?id=SFN6Wm7YBI)
-```
-@inproceedings{
-   liang2025torchtitan,
-   title={TorchTitan: One-stop PyTorch native solution for production ready {LLM} pretraining},
-   author={Wanchao Liang and Tianyu Liu and Less Wright and Will Constable and Andrew Gu and Chien-Chin Huang and Iris Zhang and Wei Feng and Howard Huang and Junjie Wang and Sanket Purandare and Gokul Nadathur and Stratos Idreos},
-   booktitle={The Thirteenth International Conference on Learning Representations},
-   year={2025},
-   url={https://openreview.net/forum?id=SFN6Wm7YBI}
-}
-```
-
+- checkpointing, CUDA graphs, CPU offload, EMA, DistMuon and SPMD type checking;
+- replicated data parallelism, and tensor, context or pipeline parallelism.
 
 ## License
 
-Source code is made available under a [BSD 3 license](./LICENSE), however you may have other legal obligations that govern your use of other content linked in this repository, such as the license or terms of service for third-party data and models.
+torchtitan is BSD 3-Clause licensed, as found in the [LICENSE](./LICENSE) file.
