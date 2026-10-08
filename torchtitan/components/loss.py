@@ -664,10 +664,7 @@ class ChunkedLossWrapper(BaseLoss):
             if fsdp_enabled:
                 from torchtitan.distributed.fsdp import get_fsdp_reshard_settings
 
-                (
-                    reshard_after_forward,
-                    reshard_after_backward,
-                ) = get_fsdp_reshard_settings(lm_head)
+                reshard_settings = get_fsdp_reshard_settings(lm_head)
                 lm_head.set_reshard_after_forward(False)
                 lm_head.set_reshard_after_backward(False)
                 lm_head.set_requires_gradient_sync(False, recurse=False)
@@ -727,6 +724,8 @@ class ChunkedLossWrapper(BaseLoss):
                             h_chunk.grad = None
 
             if fsdp_enabled:
+                # pyrefly: ignore [unbound-name]
+                reshard_after_forward, reshard_after_backward = reshard_settings
                 lm_head.set_reshard_after_forward(reshard_after_forward)
                 lm_head.set_reshard_after_backward(reshard_after_backward)
                 lm_head.reshard()
