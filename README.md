@@ -18,6 +18,8 @@ FSDP2. This page compares the two.
 | Exposed communication in that step | 340.5 ms | 265.0 ms |
 | Loss and grad_norm, 40 steps | | bitwise equal to FSDP2 |
 
+- `scripts/loss_compare.py --assert-equal --metrics loss,grad_norm` finds
+  loss and grad_norm identical at every one of the 40 steps.
 - Throughput, TFLOPs and MFU are medians over steps 10–40 of one run per
   backend. The per-step ranges overlap: 9,015–9,568 tokens/s for FSDP2 and
   8,997–9,693 for FlexShard.
@@ -39,22 +41,6 @@ Setup:
 - Real C4 (`allenai/c4`, streamed) and the `deepseek-ai/deepseek-moe-16b-base`
   tokenizer.
 - Deterministic mode, which `scripts/loss_compare.py` sets.
-
-## Numerics
-
-`scripts/loss_compare.py --assert-equal --metrics loss,grad_norm` compares
-FlexShard against FSDP2. Every run below uses the recipe's chunked loss with
-CUDA graphs off, and loss and grad_norm are identical at every step:
-
-| Model | GPUs | Parallelism | Steps |
-| --- | --- | --- | --- |
-| Llama 3 debug model | 8 | 8-way data-parallel sharding | 100 |
-| DeepSeek V3 debug model | 8 | 8-way sharding, 4-way expert parallelism | 100 |
-| DeepSeek V3 16B | 8 | 8-way sharding, 4-way expert parallelism | 40 |
-
-`tests/unit_tests/gpu/test_flex_shard.py` checks bitwise equality on 4 GPUs,
-from initialization on. It covers each `fsdp_reshard_after_forward` policy,
-gradient accumulation, expert parallelism and the chunked loss.
 
 ## Reproducing the DeepSeek V3 16B comparison
 
