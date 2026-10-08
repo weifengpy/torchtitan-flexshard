@@ -37,7 +37,7 @@ from torchtitan.distributed.cuda_graph import (
     NUM_CUDA_GRAPH_WARMUP_STEPS,
     wrap_fwd_bwd_with_cuda_graph,
 )
-from torchtitan.distributed.fsdp import set_requires_gradient_sync
+from torchtitan.distributed.fsdp import get_fsdp_group, set_requires_gradient_sync
 from torchtitan.observability import structured_logger as sl
 from torchtitan.observability.metrics import (
     build_device_memory_monitor,
@@ -171,10 +171,6 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                             "CUDA graphs (set training.disable_cuda_graphs)",
                             not self.training.disable_cuda_graphs
                             and cuda_graphs_supported(),
-                        ),
-                        (
-                            "ChunkedLossWrapper",
-                            isinstance(self.loss, ChunkedLossWrapper.Config),
                         ),
                         ("checkpointing", self.checkpointer is not None),
                         ("optim.ema", self.optim.ema is not None),
@@ -422,7 +418,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             model_with_lm_head = cast(Any, model)
             lm_head = model_with_lm_head.lm_head
             assert lm_head is not None, error_message
-            self.loss_fn.set_lm_head(lm_head)
+            self.loss_fn.set_lm_head(lm_head, get_fsdp_group(model, lm_head))
             model_with_lm_head._skip_lm_head = True
 
         logger.info(

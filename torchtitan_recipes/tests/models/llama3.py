@@ -207,14 +207,14 @@ def llama3_debugmodel_ce_loss(
     return config
 
 
-def llama3_debugmodel_ce_loss_no_cuda_graphs(
+def llama3_debugmodel_no_cuda_graphs(
     seq_len: int | None = DEFAULT_DEBUG_MODEL_SEQ_LEN,
 ) -> Trainer.Config:
-    """Debug model with standard CrossEntropyLoss and without CUDA graphs.
+    """Debug model without CUDA graphs.
 
     The FSDP2 baseline for ``llama3_debugmodel_flex_shard``.
     """
-    config = llama3_debugmodel_ce_loss(seq_len=seq_len)
+    config = llama3_debugmodel(seq_len=seq_len)
     config.training.disable_cuda_graphs = True
     return config
 
@@ -222,12 +222,12 @@ def llama3_debugmodel_ce_loss_no_cuda_graphs(
 def llama3_debugmodel_flex_shard(
     seq_len: int | None = DEFAULT_DEBUG_MODEL_SEQ_LEN,
 ) -> Trainer.Config:
-    """``llama3_debugmodel_ce_loss_no_cuda_graphs`` sharded by FlexShard.
+    """``llama3_debugmodel_no_cuda_graphs`` sharded by FlexShard.
 
-    FlexShard does not support ChunkedLossWrapper or CUDA graphs yet. Training
-    is bitwise identical to the FSDP2 baseline.
+    FlexShard does not support CUDA graphs yet. Training is bitwise identical
+    to the FSDP2 baseline.
     """
-    config = llama3_debugmodel_ce_loss_no_cuda_graphs(seq_len=seq_len)
+    config = llama3_debugmodel_no_cuda_graphs(seq_len=seq_len)
     config.parallelism = dataclasses.replace(
         config.parallelism, fsdp_backend="flex_shard"
     )

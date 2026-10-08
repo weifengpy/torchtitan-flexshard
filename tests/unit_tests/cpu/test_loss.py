@@ -1114,6 +1114,55 @@ class TestChunkedLossWrapper(unittest.TestCase):
             ],
         )
 
+    def test_fsdp_group_lifecycle(self):
+        # Another FSDP backend passes the group that shards lm_head, e.g. a
+        # FlexShard bucket storage; the wrapper makes FSDP2's calls on it.
+        events: list[str] = []
+
+        class FakeFSDPGroup:
+            reshard_after_forward = False
+            reshard_after_backward = True
+
+            def set_reshard_after_forward(self, enabled):
+                events.append(f"set_reshard_after_forward({enabled})")
+
+            def set_reshard_after_backward(self, enabled):
+                events.append(f"set_reshard_after_backward({enabled})")
+
+            def set_requires_gradient_sync(self, enabled):
+                events.append(f"set_requires_gradient_sync({enabled})")
+
+            def unshard(self):
+                events.append("unshard")
+
+            def reshard(self):
+                events.append("reshard")
+
+        class RecordingLinear(nn.Linear):
+            def forward(self, input):
+                events.append("forward")
+                return super().forward(input)
+
+        chunked_loss = ChunkedLossWrapper(ChunkedLossWrapper.Config(num_chunks=2))
+        chunked_loss.set_lm_head(RecordingLinear(4, 8, bias=False), FakeFSDPGroup())
+        chunked_loss(torch.randn(4, 4, requires_grad=True), torch.randint(0, 8, (4,)))
+
+        self.assertEqual(
+            events,
+            [
+                "set_reshard_after_forward(False)",
+                "set_reshard_after_backward(False)",
+                "set_requires_gradient_sync(False)",
+                "unshard",
+                "forward",
+                "set_requires_gradient_sync(True)",
+                "forward",
+                "set_reshard_after_forward(False)",
+                "set_reshard_after_backward(True)",
+                "reshard",
+            ],
+        )
+
     def test_numerical_equivalence(self):
         """ChunkedLossWrapper must produce the same loss and gradients as the standard path."""
         torch.manual_seed(42)
@@ -1311,7 +1360,11 @@ class TestChunkedLossWrapperFSDP(unittest.TestCase):
     def test_restores_lm_head_reshard_settings(self):
         from torch.distributed.fsdp import fully_shard
 
-        from torchtitan.distributed.fsdp import get_fsdp_reshard_settings
+        from torchtitan.distributed.fsdp import (
+            FSDPModuleGroup,
+            get_fsdp_group,
+            get_fsdp_reshard_settings,
+        )
 
         torch.manual_seed(0)
         mesh = init_device_mesh("cpu", (1,))
@@ -1321,7 +1374,9 @@ class TestChunkedLossWrapperFSDP(unittest.TestCase):
         fully_shard([model.norm, model.lm_head], mesh=mesh, reshard_after_forward=False)
         fully_shard(model, mesh=mesh)
         chunked_loss = ChunkedLossWrapper(ChunkedLossWrapper.Config(num_chunks=2))
-        chunked_loss.set_lm_head(model.lm_head)
+        fsdp_group = get_fsdp_group(model, model.lm_head)
+        self.assertIsInstance(fsdp_group, FSDPModuleGroup)
+        chunked_loss.set_lm_head(model.lm_head, fsdp_group)
 
         for _ in range(2):
             pred = model(torch.randn(4, 8))
