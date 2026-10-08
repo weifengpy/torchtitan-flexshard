@@ -30,17 +30,30 @@ FSDP2. This page compares the two.
   - reduce-scatters: 8.6 vs 14.3 ms;
   - expert-parallel all-to-all: 220.0 vs 235.4 ms.
 
-Setup:
+### Configuration
 
-- 8 NVIDIA H100 GPUs with 8-way data-parallel sharding and 4-way expert
-  parallelism; routed experts are sharded over 2-rank meshes.
-- The `deepseek_v3_16b` recipe at sequence length 4,096, with 4 sequences per
-  GPU per step. It keeps the recipe's chunked loss (`ChunkedLossWrapper`, 8
-  chunks), selective activation checkpointing and FlexAttention. CUDA graphs are
-  off, since FlexShard doesn't support them yet.
-- Real C4 (`allenai/c4`, streamed) and the `deepseek-ai/deepseek-moe-16b-base`
-  tokenizer.
-- Deterministic mode, which `scripts/loss_compare.py` sets.
+Both backends run the `deepseek_v3_16b` recipe with the same settings; only
+`parallelism.fsdp_backend` differs.
+
+| Setting | Value |
+| --- | --- |
+| Hardware | 8 NVIDIA H100 GPUs, one node |
+| Model | DeepSeek V3 16B: 15.7B parameters; 27 layers, the first dense and 26 MoE; dim 2,048; multi-head latent attention; per MoE layer, 64 routed experts (top-6, sigmoid routing) and 2 shared experts; vocabulary 102,400 |
+| Data-parallel sharding | 8-way (`data_parallel_shard_degree=8`), no replication. Dense parameters are sharded over all 8 GPUs. |
+| Expert parallelism | 4-way (`expert_parallel_degree=4`; the recipe's default is 8), with the all-to-all token dispatcher. Each expert-parallel rank owns 16 of the 64 routed experts, and their parameters are sharded over a 2-GPU mesh (`edp_shard`), so each GPU stores half of them. |
+| Tensor, context, pipeline parallelism | None |
+| Sharding groups | One per FSDP2 `fully_shard` group: the embedding; the final norm with lm_head; the dense layer; and, for each MoE layer, its dense parameters on the 8-GPU mesh and its routed experts on the 2-GPU mesh. FlexShard uses `Shard` placements on the same dims as FSDP2, with FSDP2's parameter order (`fsdp2_compatible=True`). |
+| Reshard after forward | `default` policy: the embedding and transformer layers reshard after forward; the norm and lm_head group doesn't. |
+| Prefetch | FSDP2's explicit expert-parallel schedule: each layer prefetches the next in forward and the previous in backward. |
+| Mixed precision | bf16 parameters, fp32 gradient reduction; gradients are summed without division. |
+| Loss | `ChunkedLossWrapper` with 8 chunks: each GPU's 16,384 tokens go through lm_head and cross-entropy (over the full 102,400-token vocabulary) in chunks of 2,048 tokens, each with its own backward. The norm and lm_head group stays gathered across the chunks. lm_head's gradient is reduce-scattered once, at the last chunk, and the norm's in the backward through the decoder. |
+| Batch | 4 sequences of 4,096 tokens per GPU per step: 16,384 tokens per GPU and 131,072 per step, without gradient accumulation. The recipe's 16,384-token sequences ran out of memory on FSDP2 with plain cross-entropy. |
+| Activation checkpointing | Per-op selective (`SelectiveAC`) |
+| Compile | Local regions (`loss`, `fused_binary_activation`, `fp32_to_bf16_split`) and FlexAttention |
+| CUDA graphs | Off; FlexShard doesn't support them yet. |
+| Data | C4 (`allenai/c4`, streamed), with the `deepseek-ai/deepseek-moe-16b-base` tokenizer |
+| Optimizer | AdamW, learning rate 2.2e-4, warming up over all 40 steps |
+| Determinism | On, as `scripts/loss_compare.py` sets it |
 
 ## Reproducing the DeepSeek V3 16B comparison
 
