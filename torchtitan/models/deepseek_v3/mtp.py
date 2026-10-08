@@ -232,6 +232,15 @@ class MTPDecoder(Decoder):
             resolve_sparse_fsdp_mesh,
         )
 
+        if self.mtp_layers is None:
+            # Without MTP layers, this is the decoder's sharding, which FlexShard
+            # also supports.
+            super()._apply_fsdp(
+                parallelism_context=parallelism_context,
+                training=training,
+                parallelism=parallelism,
+            )
+            return
         require_fsdp2_backend(parallelism, "DeepSeek V3 with MTP layers")
 
         dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallelism_context)

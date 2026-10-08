@@ -99,7 +99,6 @@ def test_parallelism_config_rejects_unknown_fsdp_backend() -> None:
         {"data_parallel_replicate_degree": 2},
         {"tensor_parallel_degree": 2},
         {"context_parallel_degree": 2},
-        {"expert_parallel_degree": 2},
         {"pipeline_parallel_degree": 2},
         {"fsdp_symm_mem_scope": "all"},
     ],
@@ -108,3 +107,7 @@ def test_flex_shard_rejects_unsupported_parallelism(kwargs: dict) -> None:
     (name,) = kwargs
     with pytest.raises(ValueError, match=rf"does not support parallelism\.{name}="):
         ParallelismConfig(fsdp_backend="flex_shard", **kwargs)
+
+
+def test_flex_shard_supports_expert_parallelism() -> None:
+    ParallelismConfig(fsdp_backend="flex_shard", expert_parallel_degree=2)
