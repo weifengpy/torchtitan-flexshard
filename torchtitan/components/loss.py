@@ -7,7 +7,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Literal, TypeAlias
+from typing import Any, Literal, TYPE_CHECKING, TypeAlias
 
 import spmd_types as spmd
 import torch
@@ -20,6 +20,9 @@ from torchtitan.config import Configurable
 from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
 from torchtitan.distributed.local_compile import local_compile
 from torchtitan.distributed.spmd_types import current_spmd_mesh, spmd_mesh_size
+
+if TYPE_CHECKING:
+    from torchtitan.distributed.fsdp import FSDPGroup
 
 # PyTorch's default ignore index for cross-entropy loss
 IGNORE_INDEX = -100
@@ -515,7 +518,7 @@ class ChunkedLossWrapper(BaseLoss):
     6. Assemble one full gradient [T, D] per output via GradAccumulator
     7. Backward through the decoder once with all accumulated gradients
 
-    FSDP2 composability:
+    FSDP composability (FSDP2 or FlexShard):
         The lm_head's FSDP reshard-after-forward and reshard-after-backward are
         temporarily disabled during the chunked loop so that the weight stays
         unsharded across all outputs and chunks (avoiding repeated all-gathers),
@@ -549,10 +552,17 @@ class ChunkedLossWrapper(BaseLoss):
         self.num_chunks = config.num_chunks
         self.loss_fn: BaseLoss = config.loss_fn.build()
         self.lm_head: nn.Module | None = None
+        self.lm_head_fsdp_group: "FSDPGroup | None" = None
 
-    def set_lm_head(self, lm_head: nn.Module) -> None:
-        """Set the lm_head module. Must be called before the first __call__."""
+    def set_lm_head(
+        self, lm_head: nn.Module, fsdp_group: "FSDPGroup | None" = None
+    ) -> None:
+        """Set the lm_head module and the FSDP group that shards its
+        parameters (see ``torchtitan.distributed.fsdp.get_fsdp_group``), if
+        not lm_head's own FSDP2 group. Must be called before the first
+        __call__."""
         self.lm_head = lm_head
+        self.lm_head_fsdp_group = fsdp_group
 
     def __call__(
         self,
@@ -575,6 +585,8 @@ class ChunkedLossWrapper(BaseLoss):
         autograd Function.
         """
         from torch.distributed._composable.fsdp import FSDPModule
+
+        from torchtitan.distributed.fsdp import FSDPModuleGroup
 
         num_chunks = self.num_chunks
         lm_head = self.lm_head
@@ -653,7 +665,9 @@ class ChunkedLossWrapper(BaseLoss):
                 )
             metrics: dict[str, torch.Tensor] = {}
 
-            fsdp_enabled = isinstance(lm_head, FSDPModule)
+            fsdp_group = self.lm_head_fsdp_group
+            if fsdp_group is None and isinstance(lm_head, FSDPModule):
+                fsdp_group = FSDPModuleGroup(lm_head)
             # Disable FSDP reshard on lm_head to keep its weight unsharded across
             # all outputs and chunks, avoiding repeated all-gathers, then restore
             # the reshard settings: forcing them on would make an lm_head group
@@ -661,13 +675,14 @@ class ChunkedLossWrapper(BaseLoss):
             # every later forward's end and all-gather again below. Coalesce
             # gradient synchronization into one reduce-scatter at the final chunk
             # by disabling it for chunks 0..N-2.
-            if fsdp_enabled:
-                from torchtitan.distributed.fsdp import get_fsdp_reshard_settings
-
-                reshard_settings = get_fsdp_reshard_settings(lm_head)
-                lm_head.set_reshard_after_forward(False)
-                lm_head.set_reshard_after_backward(False)
-                lm_head.set_requires_gradient_sync(False, recurse=False)
+            if fsdp_group is not None:
+                reshard_settings = (
+                    fsdp_group.reshard_after_forward,
+                    fsdp_group.reshard_after_backward,
+                )
+                fsdp_group.set_reshard_after_forward(False)
+                fsdp_group.set_reshard_after_backward(False)
+                fsdp_group.set_requires_gradient_sync(False)
                 # An implicit unshard stores an all-gather event in FSDP's shared
                 # all_gather_state for the next FSDP module to consume. Since
                 # lm_head is the final FSDP forward in this loop, eager warmup
@@ -675,13 +690,11 @@ class ChunkedLossWrapper(BaseLoss):
                 # on its eager event. Explicitly unshard while FSDP is idle to
                 # avoid populating the shared state.
                 with spmd.no_typecheck():
-                    lm_head.unshard()
+                    fsdp_group.unshard()
 
             for chunk_index in range(num_chunks):
-                if fsdp_enabled and chunk_index == num_chunks - 1:
-                    lm_head.set_requires_gradient_sync(  # pyrefly: ignore[not-callable]
-                        True, recurse=False
-                    )
+                if fsdp_group is not None and chunk_index == num_chunks - 1:
+                    fsdp_group.set_requires_gradient_sync(True)
 
                 h_chunks = tuple(
                     chunks[chunk_index] for chunks in hidden_state_chunks_per_output
@@ -723,12 +736,12 @@ class ChunkedLossWrapper(BaseLoss):
                             grad_accumulator.add(h_chunk.grad)
                             h_chunk.grad = None
 
-            if fsdp_enabled:
+            if fsdp_group is not None:
                 # pyrefly: ignore [unbound-name]
                 reshard_after_forward, reshard_after_backward = reshard_settings
-                lm_head.set_reshard_after_forward(reshard_after_forward)
-                lm_head.set_reshard_after_backward(reshard_after_backward)
-                lm_head.reshard()
+                fsdp_group.set_reshard_after_forward(reshard_after_forward)
+                fsdp_group.set_reshard_after_backward(reshard_after_backward)
+                fsdp_group.reshard()
             if not requires_grad:
                 return total_loss, metrics
 
