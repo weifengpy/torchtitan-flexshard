@@ -567,6 +567,13 @@ class TestFlexShardDecoder(DTensorTestBase):
         )
 
     @with_comms
+    def test_matches_fsdp2_with_tensor_and_context_parallelism(self):
+        # FSDP2 lays parameters out on the flattened dp_shard x cp mesh and tp.
+        self._check_matches_fsdp2(
+            self._context(cp=2, tp=2, sp=True), [("default", 1), ("default", 2)]
+        )
+
+    @with_comms
     def test_matches_fsdp2_with_tensor_parallelism_without_sequence_parallelism(
         self,
     ):
