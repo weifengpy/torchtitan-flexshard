@@ -156,7 +156,7 @@ def pipeline_llm(
         from torchtitan.distributed.flex_shard_fsdp import enable_pipelining
 
         # Before the schedule, which checks its stages' modules when built.
-        enable_pipelining(stages)
+        enable_pipelining()
 
     pp_schedule = _build_pipeline_schedule(
         parallelism=parallelism,
