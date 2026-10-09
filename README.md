@@ -64,11 +64,11 @@ Requirements:
   [pytorch/pytorch#200179](https://github.com/pytorch/pytorch/pull/200179). Any
   nightly from 2.16.0.dev20261009 on has both.
 - FlexShard with meta-pytorch/flex_shard#51 through
-  [#61](https://github.com/meta-pytorch/flex_shard/pull/61), until they land:
+  [#63](https://github.com/meta-pytorch/flex_shard/pull/63), until they land:
 
   ```bash
   pip install torchao
-  pip install --no-deps "git+https://github.com/meta-pytorch/flex_shard.git@gh/weifengpy/51/head"
+  pip install --no-deps "git+https://github.com/meta-pytorch/flex_shard.git@gh/weifengpy/53/head"
   ```
 
 Download the tokenizer:

@@ -227,7 +227,6 @@ class MTPDecoder(Decoder):
         parallelism: ParallelismConfig,
     ) -> None:
         from torchtitan.distributed.fsdp import (
-            require_fsdp2_backend,
             resolve_fsdp_mesh,
             resolve_sparse_fsdp_mesh,
         )
@@ -241,10 +240,30 @@ class MTPDecoder(Decoder):
                 parallelism=parallelism,
             )
             return
-        require_fsdp2_backend(parallelism, "DeepSeek V3 with MTP layers")
-
         dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallelism_context)
         edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallelism_context)
+        if parallelism.fsdp_backend == "flex_shard":
+            from torchtitan.distributed.flex_shard_fsdp import (
+                apply_flex_shard_to_decoder,
+            )
+
+            # The MTP layers shard like blocks after the decoder's, as
+            # apply_fsdp_to_mtp_decoder shards them.
+            apply_flex_shard_to_decoder(
+                self,
+                dp_mesh,
+                param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
+                reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+                pp_enabled=parallelism_context.pp_enabled,
+                reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
+                ep_degree=parallelism_context.ep,
+                edp_mesh=edp_mesh,
+                extra_blocks=[
+                    (f"mtp_layers.{name}", layer)
+                    for name, layer in self.mtp_layers.named_children()
+                ],
+            )
+            return
         apply_fsdp_to_mtp_decoder(
             self,
             dp_mesh,

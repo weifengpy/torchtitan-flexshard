@@ -15,9 +15,10 @@ mesh, and the block gets one bucket per group. FlexShard is imported only when
 ``parallelism.fsdp_backend='flex_shard'``.
 """
 
+import contextlib
 import logging
 import sys
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator, Sequence
 from typing import cast, TYPE_CHECKING
 
 import spmd_types as spmd
@@ -44,6 +45,7 @@ if TYPE_CHECKING:
 __all__ = [
     "apply_flex_shard_to_decoder",
     "as_fsdp2_dtensor",
+    "fsdp2_dtensor_params",
     "grads_for_norm",
 ]
 
@@ -67,6 +69,7 @@ def apply_flex_shard_to_decoder(
     reshard_after_forward_policy: str = "default",
     ep_degree: int = 1,
     edp_mesh: DeviceMesh | None = None,
+    extra_blocks: Sequence[tuple[str, nn.Module]] = (),
 ) -> None:
     """Shard a decoder with FlexShard as ``apply_fsdp_to_decoder`` does with FSDP2.
 
@@ -102,6 +105,9 @@ def apply_flex_shard_to_decoder(
         ep_degree: The expert-parallel degree.
         edp_mesh: With ``ep_degree > 1``, the sparse storage mesh, with the
             ``edp_shard`` and ``ep`` axes.
+        extra_blocks: Transformer blocks outside ``model.layers``, by FQN, each
+            sharded like a block after the last one, e.g. DeepSeek V3's MTP
+            layers, which ``apply_fsdp_to_mtp_decoder`` appends to the layers.
     """
     # flex_shard is an optional dependency, needed only for this backend.
     # pyrefly: ignore [missing-import]
@@ -206,8 +212,11 @@ def apply_flex_shard_to_decoder(
                 ["norm", "lm_head"], reshard_after_forward_policy == "always"
             )
     param_fqns = {param: fqn for fqn, param in model.named_parameters()}
-    for layer_id, transformer_block in model.layers.items():
-        block_fqn = f"layers.{layer_id}"
+    blocks = [
+        (f"layers.{layer_id}", transformer_block)
+        for layer_id, transformer_block in model.layers.items()
+    ]
+    for block_fqn, transformer_block in (*blocks, *extra_blocks):
         placements = linear_param_shard_placements(transformer_block)
         moe = None
         if getattr(transformer_block, "moe_enabled", False):
@@ -371,6 +380,30 @@ def as_fsdp2_dtensor(param: torch.Tensor) -> torch.Tensor:
     FlexShard parameters exist only once ``flex_shard`` is imported.
     """
     return _as_fsdp2_dtensor(param, param)
+
+
+@contextlib.contextmanager
+def fsdp2_dtensor_params(module: nn.Module) -> Iterator[None]:
+    """Expose ``module``'s own FlexShard parameters as the DTensors FSDP2 would
+    give them while the context is active, e.g. for ``reset_parameters``.
+
+    The DTensors view the local shards, so in-place updates reach them.
+    """
+    flex_shard = sys.modules.get("flex_shard")
+    swapped: dict[str, nn.Parameter] = {}
+    if flex_shard is not None:
+        for name, param in module.named_parameters(recurse=False):
+            if flex_shard.is_flex_shard_param(param):
+                swapped[name] = param
+                module._parameters[name] = nn.Parameter(
+                    _as_fsdp2_dtensor(param, param),
+                    requires_grad=param.requires_grad,
+                )
+    try:
+        yield
+    finally:
+        for name, param in swapped.items():
+            module._parameters[name] = param
 
 
 def grads_for_norm(parameters: Iterable[torch.Tensor]) -> list[torch.Tensor]:
