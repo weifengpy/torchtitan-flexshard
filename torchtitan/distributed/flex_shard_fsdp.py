@@ -20,11 +20,13 @@ import sys
 from collections.abc import Iterable
 from typing import cast, TYPE_CHECKING
 
+import spmd_types as spmd
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch._prims_common import make_contiguous_strides_for
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor import DTensor, Shard
+from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.tensor.placement_types import _StridedShard
 
 from torchtitan.distributed.fsdp import (
@@ -32,6 +34,8 @@ from torchtitan.distributed.fsdp import (
     linear_param_shard_placements,
     routed_expert_param_placements,
 )
+from torchtitan.distributed.parallelism_context import MeshAxisName
+from torchtitan.distributed.spmd_types import _per_axis_types, spmd_axes
 
 if TYPE_CHECKING:
     from torchtitan.models.common.decoder import Decoder
@@ -48,6 +52,9 @@ logger = logging.getLogger(__name__)
 # The edp_shard meshes of FlexShard's routed-expert buckets, mapped to the sparse
 # storage mesh on which FSDP2 lays out their parameters, with the ep axis.
 _EXPERT_STORAGE_MESHES: dict[DeviceMesh, DeviceMesh] = {}
+# Under tensor parallelism, the dp_shard meshes of the other buckets, mapped to
+# the dense storage mesh on which FSDP2 lays out their parameters, with tp.
+_DENSE_STORAGE_MESHES: dict[DeviceMesh, DeviceMesh] = {}
 
 
 def apply_flex_shard_to_decoder(
@@ -71,7 +78,10 @@ def apply_flex_shard_to_decoder(
 
     Buckets shard over ``storage_mesh``'s ``dp_shard`` axis. With context
     parallelism they shard over ``dp_shard`` and ``cp``, flattened as
-    ``fully_shard`` flattens several shard axes.
+    ``fully_shard`` flattens several shard axes. With tensor parallelism,
+    parameters are TP-local shards: they declare their TP layout, and the
+    parameters typed ``R`` on tp, whose grads FSDP2 all-reduces over TP before
+    its reduce-scatter, declare the TP group as their partial-grad group.
 
     With expert parallelism, ``fully_shard`` splits an MoE block into two
     groups: the routed experts on ``edp_mesh``'s ``edp_shard`` axis, and the
@@ -82,7 +92,8 @@ def apply_flex_shard_to_decoder(
     Args:
         model: The decoder to shard.
         storage_mesh: The dense storage mesh from ``resolve_fsdp_mesh``, with the
-            ``dp_shard`` axis, and ``cp`` under context parallelism.
+            ``dp_shard`` axis, and ``cp`` or ``tp`` when context or tensor
+            parallelism is on.
         param_dtype: The dtype of the unsharded parameters.
         reduce_dtype: The dtype of gradient reduction.
         pp_enabled: Whether pipeline parallelism is enabled.
@@ -105,10 +116,15 @@ def apply_flex_shard_to_decoder(
     elif mesh_axis_names == ("dp_shard", "cp"):
         # The flattened mesh fully_shard creates for these shard axes.
         dp_mesh = storage_mesh["dp_shard", "cp"]._flatten("dp_shard_cp")
+    elif mesh_axis_names == ("dp_shard", "tp"):
+        dp_mesh = storage_mesh["dp_shard"]
+        _DENSE_STORAGE_MESHES[dp_mesh] = storage_mesh
+        _declare_spmd_global_layouts(model, storage_mesh, routed_experts=False)
+        _declare_tensor_parallel_partial_grads(model, storage_mesh.get_group("tp"))
     else:
         raise ValueError(
-            "FlexShard shards over the dp_shard axis, with cp under context "
-            f"parallelism, but got mesh axes {mesh_axis_names}."
+            "FlexShard shards over the dp_shard axis, with cp or tp under context "
+            f"or tensor parallelism, but got mesh axes {mesh_axis_names}."
         )
     expert_mesh = None
     if ep_degree > 1:
@@ -120,7 +136,7 @@ def apply_flex_shard_to_decoder(
             )
         expert_mesh = edp_mesh["edp_shard"]
         _EXPERT_STORAGE_MESHES[expert_mesh] = edp_mesh
-        _declare_spmd_global_layouts(model, edp_mesh)
+        _declare_spmd_global_layouts(model, edp_mesh, routed_experts=True)
     reshard_after_forward = get_fsdp_reshard_after_forward_policy(
         reshard_after_forward_policy, pp_enabled
     )
@@ -240,14 +256,18 @@ def apply_flex_shard_to_decoder(
     logger.info("Applied FlexShard to the model")
 
 
-def _declare_spmd_global_layouts(model: nn.Module, mesh: DeviceMesh) -> None:
+def _declare_spmd_global_layouts(
+    model: nn.Module, mesh: DeviceMesh, *, routed_experts: bool
+) -> None:
     """Declare where each parameter sits in its full parameter, from the SPMD
     layouts ``Module._parallelize`` records in each module's ``_sharding_config``.
 
     ``_parallelize`` leaves routed experts as each ep rank's plain local shard
-    of the experts' dim 0. Declared before ``flex_shard``, the layout composes
-    with FlexShard's own split over ``edp_shard``, so checkpoints describe the
-    experts of every ep rank. Axes absent from ``mesh`` count as size 1.
+    of the experts' dim 0, and TP-sharded parameters as each tp rank's shard.
+    Declared before ``flex_shard``, the layout composes with FlexShard's own
+    split, so checkpoints describe the full parameters. ``routed_experts``
+    selects the layouts on the sparse mesh, with the ep axis, or the others,
+    on the dense storage mesh. Axes absent from ``mesh`` count as size 1.
     """
     # pyrefly: ignore [missing-import]
     from flex_shard.layout_adapters.spmd_types import spmd_types_to_global_layout
@@ -259,8 +279,34 @@ def _declare_spmd_global_layouts(model: nn.Module, mesh: DeviceMesh) -> None:
             continue
         prefix = f"{module_fqn}." if module_fqn else ""
         for name, layout in sharding_config.state_shardings.items():
-            layouts[f"{prefix}{name}"] = layout
+            if (MeshAxisName.EP in spmd_axes(layout)) == routed_experts:
+                layouts[f"{prefix}{name}"] = layout
     spmd_types_to_global_layout(model, layouts, mesh)
+
+
+def _declare_tensor_parallel_partial_grads(
+    model: nn.Module, tp_group: dist.ProcessGroup
+) -> None:
+    """Declare the TP group on the parameters typed ``R`` on tp.
+
+    Under sequence parallelism, these are the norm weights: each tp rank's grad
+    covers its own tokens. FSDP2 types such a grad ``P`` and all-reduces it over
+    TP before its reduce-scatter; FlexShard does the same for a declared group.
+    """
+    # pyrefly: ignore [missing-import]
+    from flex_shard import set_partial_grad_group
+
+    for module in model.modules():
+        sharding_config = getattr(module, "_sharding_config", None)
+        if sharding_config is None:
+            continue
+        for name, layout in sharding_config.state_shardings.items():
+            param = module._parameters.get(name)
+            if (
+                param is not None
+                and _per_axis_types(layout).get(MeshAxisName.TP) is spmd.R
+            ):
+                set_partial_grad_group(param, tp_group)
 
 
 def _set_explicit_prefetch(
@@ -341,7 +387,27 @@ def _as_fsdp2_dtensor(tensor: torch.Tensor, param: torch.Tensor) -> torch.Tensor
     global_shape = flex_shard.get_global_shape(param)
     mesh = flex_shard.get_mesh(param)
     placements = tuple(Shard(p.dim) for p in flex_shard.get_placements(param))
-    if (storage_mesh := _EXPERT_STORAGE_MESHES.get(mesh)) is not None:
+    if (storage_mesh := _DENSE_STORAGE_MESHES.get(mesh)) is not None:
+        # Under TP, the global shape is the TP-local shape. As FSDP2 does, lay
+        # the parameter out on (dp_shard, tp), with Shard on tp for the dim its
+        # TP layout splits; the dp_shard placement then shards within each TP
+        # shard of that dim.
+        (fsdp_placement,) = placements
+        tp_placement: Shard | Replicate = Replicate()
+        if (outer_layout := flex_shard.get_outer_layout(param)) is not None:
+            for dim, (size, local_size) in enumerate(
+                zip(outer_layout.global_shape, global_shape, strict=True)
+            ):
+                if size != local_size:
+                    tp_placement = Shard(dim)
+            global_shape = torch.Size(outer_layout.global_shape)
+        if isinstance(tp_placement, Shard) and tp_placement.dim == fsdp_placement.dim:
+            fsdp_placement = _StridedShard(
+                fsdp_placement.dim, split_factor=storage_mesh["tp"].size()
+            )
+        placements = (fsdp_placement, tp_placement)
+        mesh = storage_mesh
+    elif (storage_mesh := _EXPERT_STORAGE_MESHES.get(mesh)) is not None:
         # Expert parallelism shards the experts' dim 0 over ep; FlexShard's
         # global shape is one ep rank's experts. As in FSDP2, the edp_shard
         # placement shards within each ep shard of the same dim.

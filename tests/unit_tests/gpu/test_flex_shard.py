@@ -15,7 +15,6 @@ import spmd_types as spmd
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
-import torch.nn.functional as F
 from torch.distributed.checkpoint.format_utils import dcp_to_torch_save
 from torch.distributed.checkpoint.metadata import TensorStorageMetadata
 from torch.distributed.tensor import DTensor
@@ -26,7 +25,11 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 from torch.testing._internal.distributed.checkpoint_utils import with_temp_dir
 
 from torchtitan.components.checkpointer import CheckpointManager
-from torchtitan.components.loss import ChunkedLossWrapper
+from torchtitan.components.loss import (
+    ChunkedLossWrapper,
+    cross_entropy_loss,
+    CrossEntropyLoss,
+)
 from torchtitan.components.optim import AdamW, OptimizersContainer
 from torchtitan.config import TrainingConfig
 from torchtitan.config.configs import DebugConfig
@@ -131,7 +134,14 @@ class TestFlexShardDecoder(DTensorTestBase):
         if chunked_loss:
             # As the trainer sets it up: the model returns the hidden states,
             # and the loss applies lm_head to each chunk of them.
-            loss_fn = ChunkedLossWrapper(ChunkedLossWrapper.Config(num_chunks=4))
+            loss_fn = ChunkedLossWrapper(
+                ChunkedLossWrapper.Config(
+                    num_chunks=4,
+                    loss_fn=CrossEntropyLoss.Config(
+                        global_vocab_size=model_config.vocab_size
+                    ),
+                )
+            )
             loss_fn.set_lm_head(model.lm_head, get_fsdp_group(model, model.lm_head))
             model._skip_lm_head = True
         # One packed sequence per microbatch, as the data loader produces. The
@@ -174,7 +184,15 @@ class TestFlexShardDecoder(DTensorTestBase):
                 with parallelism_context.activate_spmd():
                     output = model(inputs, **model_kwargs)
                     if loss_fn is None:
-                        loss = F.cross_entropy(output.float(), labels)
+                        # Vocab-parallel under TP, as the trainer's loss.
+                        loss = (
+                            cross_entropy_loss(
+                                output,
+                                labels,
+                                global_vocab_size=model_config.vocab_size,
+                            )
+                            / labels.numel()
+                        )
                     else:
                         loss, _ = loss_fn(output, labels)
                     with spmd.no_typecheck():
@@ -315,16 +333,18 @@ class TestFlexShardDecoder(DTensorTestBase):
             chunked_loss=True,
         )
 
-    def _context(self, *, ep: int = 1, cp: int = 1) -> ParallelismContext:
+    def _context(
+        self, *, ep: int = 1, cp: int = 1, tp: int = 1, sp: bool = False
+    ) -> ParallelismContext:
         return ParallelismContext(
             dp_replicate=1,
-            dp_shard=self.world_size // cp,
+            dp_shard=self.world_size // (cp * tp),
             cp=cp,
-            tp=1,
+            tp=tp,
             pp=1,
             ep=ep,
             world_size=self.world_size,
-            enable_sequence_parallel=False,
+            enable_sequence_parallel=sp,
         )
 
     def _optimizers(self, model) -> OptimizersContainer:
@@ -511,6 +531,38 @@ class TestFlexShardDecoder(DTensorTestBase):
         # steps match those of an uninterrupted run bit for bit. The resumed run
         # then saves again, and a load of that checkpoint restores its state.
         self._check_resumes_across_backends(self._context(ep=1))
+
+    @with_comms
+    def test_matches_fsdp2_with_tensor_parallelism(self):
+        # Parameters are TP-local shards, sharded over dp_shard. With sequence
+        # parallelism, the norm weights' grads are partial over TP, and both
+        # backends all-reduce them over TP before the reduce-scatter.
+        parallelism_context = self._context(tp=2, sp=True)
+        self._check_matches_fsdp2(
+            parallelism_context, product(("default", "always"), (1, 2))
+        )
+        self._check_matches_fsdp2(
+            parallelism_context, [("default", 1), ("default", 2)], chunked_loss=True
+        )
+
+    @with_comms
+    def test_matches_fsdp2_with_tensor_parallelism_without_sequence_parallelism(
+        self,
+    ):
+        # The norm weights are then typed I on tp: no TP all-reduce.
+        self._check_matches_fsdp2(
+            self._context(tp=2), product(("default", "always"), (1, 2))
+        )
+
+    @with_comms
+    @with_temp_dir
+    def test_checkpoints_match_fsdp2_with_tensor_parallelism(self):
+        self._check_checkpoints_match_fsdp2(self._context(tp=2, sp=True))
+
+    @with_comms
+    @with_temp_dir
+    def test_resumes_across_backends_with_tensor_parallelism(self):
+        self._check_resumes_across_backends(self._context(tp=2, sp=True))
 
     @with_comms
     def test_matches_fsdp2_with_context_parallelism(self):
