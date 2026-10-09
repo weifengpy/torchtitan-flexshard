@@ -31,9 +31,14 @@ from torchtitan.components.optim import AdamW, OptimizersContainer
 from torchtitan.config import TrainingConfig
 from torchtitan.config.configs import DebugConfig
 from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.config.transform import ContextParallelTransform
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.distributed.fsdp import get_fsdp_group, set_requires_gradient_sync
 from torchtitan.distributed.parallelism_context import ParallelismContext
+from torchtitan.models.common.attention.attention import FlexInnerAttention
+from torchtitan.models.common.attention.cp_attention import (
+    KVAllGatherCPFlexInnerAttention,
+)
 from torchtitan.models.deepseek_v3 import (
     build_model_config as build_deepseek_v3_model_config,
 )
@@ -44,6 +49,11 @@ flex_shard = pytest.importorskip("flex_shard")
 pytestmark = pytest.mark.multi_gpu
 
 _SEQ_LEN = 128
+
+
+def _seq_len(parallelism_context: ParallelismContext) -> int:
+    # CP's FlexAttention needs one 128-token block per cp rank.
+    return _SEQ_LEN * parallelism_context.cp
 
 
 def _local(tensor: torch.Tensor) -> torch.Tensor:
@@ -64,12 +74,22 @@ class TestFlexShardDecoder(DTensorTestBase):
         build_config=build_model_config,
     ):
         parallelism = ParallelismConfig(
-            data_parallel_shard_degree=self.world_size,
+            data_parallel_shard_degree=parallelism_context.dp_shard,
+            context_parallel_degree=parallelism_context.cp,
+            tensor_parallel_degree=parallelism_context.tp,
+            enable_sequence_parallel=parallelism_context.enable_sequence_parallel,
             expert_parallel_degree=parallelism_context.ep,
             fsdp_backend=fsdp_backend,
             fsdp_reshard_after_forward=reshard_after_forward,
         )
-        model_config = build_config("debugmodel", seq_len=_SEQ_LEN)
+        model_config = build_config("debugmodel", seq_len=_seq_len(parallelism_context))
+        if parallelism_context.cp > 1:
+            # As CP recipes do: attention all-gathers keys and values over cp.
+            model_config = ContextParallelTransform(
+                inner_attention_map={
+                    FlexInnerAttention: KVAllGatherCPFlexInnerAttention
+                }
+            ).transform(model_config)
         model_config.set_sharding_(parallelism)
         with parallelism_context.activate_spmd(), torch.device("meta"):
             model = model_config.build()
@@ -114,8 +134,12 @@ class TestFlexShardDecoder(DTensorTestBase):
             loss_fn = ChunkedLossWrapper(ChunkedLossWrapper.Config(num_chunks=4))
             loss_fn.set_lm_head(model.lm_head, get_fsdp_group(model, model.lm_head))
             model._skip_lm_head = True
-        # One packed sequence per microbatch, as the data loader produces.
-        positions = torch.arange(_SEQ_LEN, device=self.device_type)
+        # One packed sequence per microbatch, as the data loader produces. The
+        # data-parallel ranks get different data; their CP and TP peers share it.
+        seq_len = _seq_len(parallelism_context)
+        positions = torch.arange(seq_len, device=self.device_type)
+        dp_mesh = parallelism_context.get_mesh("dp_shard")
+        dp_rank, dp_size = dp_mesh.get_local_rank(), dp_mesh.size()
         history = []
         for step in steps:
             losses = []
@@ -123,25 +147,28 @@ class TestFlexShardDecoder(DTensorTestBase):
                 if microbatches > 1:
                     set_requires_gradient_sync(model, microbatch == microbatches - 1)
                 generator = torch.Generator().manual_seed(
-                    1000 * step + 10 * microbatch + self.rank
+                    1000 * step + 10 * microbatch + dp_rank
                 )
                 tokens, labels = (
                     torch.randint(
-                        model_config.vocab_size, (_SEQ_LEN,), generator=generator
+                        model_config.vocab_size, (seq_len,), generator=generator
                     ).to(self.device_type)
                     for _ in range(2)
                 )
-                inputs, labels, model_kwargs = model.preprocess_inputs(
-                    {"input": tokens, "labels": labels, "positions": positions},
-                    parallelism_context=parallelism_context,
-                    parallelism=parallelism,
-                    max_context_length=_SEQ_LEN,
-                )
+                # CP shards the inputs over the active SPMD mesh's cp axis.
+                with parallelism_context.activate_spmd():
+                    inputs, labels, model_kwargs = model.preprocess_inputs(
+                        {"input": tokens, "labels": labels, "positions": positions},
+                        parallelism_context=parallelism_context,
+                        parallelism=parallelism,
+                        max_context_length=seq_len,
+                    )
                 if "aux_loss_denominators" in model_kwargs:
                     # The trainer's global routed-token count: no padding, so
-                    # every token of every microbatch on every rank.
+                    # every token of every microbatch on every data-parallel
+                    # rank.
                     model_kwargs["aux_loss_denominators"] = torch.tensor(
-                        [_SEQ_LEN * self.world_size * microbatches],
+                        [seq_len * dp_size * microbatches],
                         device=self.device_type,
                     )
                 with parallelism_context.activate_spmd():
@@ -288,11 +315,11 @@ class TestFlexShardDecoder(DTensorTestBase):
             chunked_loss=True,
         )
 
-    def _context(self, ep: int) -> ParallelismContext:
+    def _context(self, *, ep: int = 1, cp: int = 1) -> ParallelismContext:
         return ParallelismContext(
             dp_replicate=1,
-            dp_shard=self.world_size,
-            cp=1,
+            dp_shard=self.world_size // cp,
+            cp=cp,
             tp=1,
             pp=1,
             ep=ep,
@@ -484,6 +511,24 @@ class TestFlexShardDecoder(DTensorTestBase):
         # steps match those of an uninterrupted run bit for bit. The resumed run
         # then saves again, and a load of that checkpoint restores its state.
         self._check_resumes_across_backends(self._context(ep=1))
+
+    @with_comms
+    def test_matches_fsdp2_with_context_parallelism(self):
+        # Parameters shard over dp_shard x cp, flattened as fully_shard does,
+        # and the reduce-scatter sums the grads of every sequence chunk.
+        self._check_matches_fsdp2(
+            self._context(cp=2), product(("default", "always"), (1, 2))
+        )
+
+    @with_comms
+    @with_temp_dir
+    def test_checkpoints_match_fsdp2_with_context_parallelism(self):
+        self._check_checkpoints_match_fsdp2(self._context(cp=2))
+
+    @with_comms
+    @with_temp_dir
+    def test_resumes_across_backends_with_context_parallelism(self):
+        self._check_resumes_across_backends(self._context(cp=2))
 
     @with_comms
     @with_temp_dir
