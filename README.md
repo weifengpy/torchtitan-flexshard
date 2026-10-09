@@ -118,9 +118,9 @@ expert, context, tensor and pipeline parallelism. It supports CUDA
 graphs, activation checkpointing, local compile regions, FlexAttention, the
 chunked loss, DeepSeek V3's multi-token prediction, SPMD type checking
 (`debug.spmd_typechecking`), and checkpointing with `CheckpointManager`, whose
-checkpoints load across the two backends. CUDA graphs are tested without
-expert parallelism; with it, they need the HybridEP token dispatcher, which
-hasn't been tested with FlexShard yet. It doesn't yet support:
+checkpoints load across the two backends. With expert parallelism, torchtitan
+supports CUDA graphs only with the HybridEP token dispatcher, for both
+backends. It doesn't yet support:
 
 - CPU offload, EMA and DistMuon;
 - Hugging Face checkpoint conversion, `async_with_pinned_mem` checkpointing and
