@@ -206,7 +206,6 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                                 for optimizer in self.optim.optimizer.optimizers
                             ),
                         ),
-                        ("debug.spmd_typechecking", self.debug.spmd_typechecking),
                     )
                     if enabled
                 ]
