@@ -152,6 +152,12 @@ def pipeline_llm(
         #       in case the model is modified e.g. by torch.compile
         stages[i].submod = m
 
+    if parallelism.fsdp_backend == "flex_shard":
+        from torchtitan.distributed.flex_shard_fsdp import enable_pipelining
+
+        # Before the schedule, which checks its stages' modules when built.
+        enable_pipelining(stages)
+
     pp_schedule = _build_pipeline_schedule(
         parallelism=parallelism,
         num_microbatches=parallelism.num_pp_microbatches,
