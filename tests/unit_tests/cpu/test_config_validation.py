@@ -137,22 +137,21 @@ def test_flex_shard_rejects_features_it_lacks() -> None:
     config = llama3_debugmodel()
     config.parallelism = ParallelismConfig(fsdp_backend="flex_shard")
 
-    with _cuda_graphs_supported(True), pytest.raises(
-        ValueError,
-        match=r"does not support CUDA graphs \(set training\.disable_cuda_graphs\) yet",
-    ):
+    # CUDA graphs and the recipe's ChunkedLossWrapper stay.
+    with _cuda_graphs_supported(True):
         TrainingEngine.Config.__post_init__(config)
 
-    # The recipe's ChunkedLossWrapper stays.
-    config.training.disable_cuda_graphs = True
-    with _cuda_graphs_supported(True):
+    config.training.enable_cpu_offload = True
+    config.debug.distinct_seed_mesh_axes = ["dp_shard"]
+    with pytest.raises(
+        ValueError, match=r"does not support training\.enable_cpu_offload yet"
+    ):
         TrainingEngine.Config.__post_init__(config)
 
 
 def test_flex_shard_checkpointing() -> None:
     config = llama3_debugmodel()
     config.parallelism = ParallelismConfig(fsdp_backend="flex_shard")
-    config.training.disable_cuda_graphs = True
 
     for checkpointer in (
         CheckpointManager.Config(),
