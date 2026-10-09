@@ -258,7 +258,6 @@ class ParallelismConfig:
                         self.data_parallel_replicate_degree,
                     ),
                     ("tensor_parallel_degree", self.tensor_parallel_degree),
-                    ("context_parallel_degree", self.context_parallel_degree),
                     ("pipeline_parallel_degree", self.pipeline_parallel_degree),
                 )
                 if degree != 1
@@ -271,7 +270,8 @@ class ParallelismConfig:
                 raise ValueError(
                     "parallelism.fsdp_backend='flex_shard' supports only data "
                     "parallelism over data_parallel_shard_degree, with expert "
-                    f"parallelism, so far; it does not support {', '.join(unsupported)}."
+                    "and context parallelism, so far; it does not support "
+                    f"{', '.join(unsupported)}."
                 )
         if self.fsdp_symm_mem_scope is not None and (
             not torch.cuda.is_available()
