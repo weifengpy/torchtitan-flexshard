@@ -17,7 +17,7 @@ mesh, and the block gets one bucket per group. FlexShard is imported only when
 
 import logging
 import sys
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from typing import cast, TYPE_CHECKING
 
 import spmd_types as spmd
@@ -67,6 +67,7 @@ def apply_flex_shard_to_decoder(
     reshard_after_forward_policy: str = "default",
     ep_degree: int = 1,
     edp_mesh: DeviceMesh | None = None,
+    extra_blocks: Sequence[tuple[str, nn.Module]] = (),
 ) -> None:
     """Shard a decoder with FlexShard as ``apply_fsdp_to_decoder`` does with FSDP2.
 
@@ -102,6 +103,9 @@ def apply_flex_shard_to_decoder(
         ep_degree: The expert-parallel degree.
         edp_mesh: With ``ep_degree > 1``, the sparse storage mesh, with the
             ``edp_shard`` and ``ep`` axes.
+        extra_blocks: Transformer blocks outside ``model.layers``, by FQN, each
+            sharded like a block after the last one, e.g. DeepSeek V3's MTP
+            layers, which ``apply_fsdp_to_mtp_decoder`` appends to the layers.
     """
     # flex_shard is an optional dependency, needed only for this backend.
     # pyrefly: ignore [missing-import]
@@ -206,8 +210,11 @@ def apply_flex_shard_to_decoder(
                 ["norm", "lm_head"], reshard_after_forward_policy == "always"
             )
     param_fqns = {param: fqn for fqn, param in model.named_parameters()}
-    for layer_id, transformer_block in model.layers.items():
-        block_fqn = f"layers.{layer_id}"
+    blocks = [
+        (f"layers.{layer_id}", transformer_block)
+        for layer_id, transformer_block in model.layers.items()
+    ]
+    for block_fqn, transformer_block in (*blocks, *extra_blocks):
         placements = linear_param_shard_placements(transformer_block)
         moe = None
         if getattr(transformer_block, "moe_enabled", False):
