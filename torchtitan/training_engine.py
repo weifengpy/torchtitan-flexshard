@@ -168,11 +168,6 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                             self.training.enable_cpu_offload,
                         ),
                         (
-                            "CUDA graphs (set training.disable_cuda_graphs)",
-                            not self.training.disable_cuda_graphs
-                            and cuda_graphs_supported(),
-                        ),
-                        (
                             "checkpointers other than CheckpointManager, such as "
                             "torch_checkpointing's, whose resharder ignores "
                             "FlexShard's shard layouts",

@@ -50,7 +50,7 @@ Both backends run the `deepseek_v3_16b` recipe with the same settings; only
 | Batch | 4 sequences of 4,096 tokens per GPU per step: 16,384 tokens per GPU and 131,072 per step, without gradient accumulation. The recipe's 16,384-token sequences ran out of memory on FSDP2 with plain cross-entropy. |
 | Activation checkpointing | Per-op selective (`SelectiveAC`) |
 | Compile | Local regions (`loss`, `fused_binary_activation`, `fp32_to_bf16_split`) and FlexAttention |
-| CUDA graphs | Off; FlexShard doesn't support them yet. |
+| CUDA graphs | Off: with expert parallelism, torchtitan supports them only with the HybridEP token dispatcher. |
 | Data | C4 (`allenai/c4`, streamed), with the `deepseek-ai/deepseek-moe-16b-base` tokenizer |
 | Optimizer | AdamW, learning rate 2.2e-4, warming up over all 40 steps |
 | Determinism | On, as `scripts/loss_compare.py` sets it |
@@ -114,13 +114,15 @@ PYTHONPATH=. python scripts/loss_compare.py . . \
 ## Scope
 
 The flex_shard backend shards over `data_parallel_shard_degree` only, with
-expert, context, tensor and pipeline parallelism. It supports
-activation checkpointing, local compile regions, FlexAttention, the chunked
-loss, DeepSeek V3's multi-token prediction, SPMD type checking
+expert, context, tensor and pipeline parallelism. It supports CUDA
+graphs, activation checkpointing, local compile regions, FlexAttention, the
+chunked loss, DeepSeek V3's multi-token prediction, SPMD type checking
 (`debug.spmd_typechecking`), and checkpointing with `CheckpointManager`, whose
-checkpoints load across the two backends. It doesn't yet support:
+checkpoints load across the two backends. CUDA graphs are tested without
+expert parallelism; with it, they need the HybridEP token dispatcher, which
+hasn't been tested with FlexShard yet. It doesn't yet support:
 
-- CUDA graphs, CPU offload, EMA and DistMuon;
+- CPU offload, EMA and DistMuon;
 - Hugging Face checkpoint conversion, `async_with_pinned_mem` checkpointing and
   the `torch_checkpointing` checkpointer;
 - replicated data parallelism.
