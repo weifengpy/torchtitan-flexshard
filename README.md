@@ -114,7 +114,7 @@ PYTHONPATH=. python scripts/loss_compare.py . . \
 ## Scope
 
 The flex_shard backend shards over `data_parallel_shard_degree` only, with
-expert parallelism and either context or tensor parallelism. It supports
+expert, context and tensor parallelism. It supports
 activation checkpointing, local compile regions, FlexAttention, the chunked
 loss, and checkpointing with `CheckpointManager`, whose checkpoints load across
 the two backends. It doesn't yet support:
@@ -122,8 +122,7 @@ the two backends. It doesn't yet support:
 - CUDA graphs, CPU offload, EMA and DistMuon;
 - Hugging Face checkpoint conversion, `async_with_pinned_mem` checkpointing and
   the `torch_checkpointing` checkpointer;
-- replicated data parallelism, pipeline parallelism, and tensor and context
-  parallelism together.
+- replicated data parallelism and pipeline parallelism.
 
 ## License
 

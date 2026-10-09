@@ -119,13 +119,21 @@ def apply_flex_shard_to_decoder(
     elif mesh_axis_names == ("dp_shard", "tp"):
         dp_mesh = storage_mesh["dp_shard"]
         _DENSE_STORAGE_MESHES[dp_mesh] = storage_mesh
-        _declare_spmd_global_layouts(model, storage_mesh, routed_experts=False)
-        _declare_tensor_parallel_partial_grads(model, storage_mesh.get_group("tp"))
+    elif mesh_axis_names == ("dp_shard", "cp", "tp"):
+        dp_mesh = storage_mesh["dp_shard", "cp"]._flatten("dp_shard_cp")
+        # As FSDP2's DTensorSpec with several shard axes: the flattened mesh
+        # and tp.
+        _DENSE_STORAGE_MESHES[dp_mesh] = DeviceMesh._concatenate(
+            [dp_mesh, storage_mesh["tp"]]
+        )
     else:
         raise ValueError(
-            "FlexShard shards over the dp_shard axis, with cp or tp under context "
-            f"or tensor parallelism, but got mesh axes {mesh_axis_names}."
+            "FlexShard shards over the dp_shard axis, with cp, tp or both under "
+            f"context or tensor parallelism, but got mesh axes {mesh_axis_names}."
         )
+    if "tp" in mesh_axis_names:
+        _declare_spmd_global_layouts(model, storage_mesh, routed_experts=False)
+        _declare_tensor_parallel_partial_grads(model, storage_mesh.get_group("tp"))
     expert_mesh = None
     if ep_degree > 1:
         if edp_mesh is None or edp_mesh.mesh_dim_names != ("edp_shard", "ep"):
@@ -389,9 +397,9 @@ def _as_fsdp2_dtensor(tensor: torch.Tensor, param: torch.Tensor) -> torch.Tensor
     placements = tuple(Shard(p.dim) for p in flex_shard.get_placements(param))
     if (storage_mesh := _DENSE_STORAGE_MESHES.get(mesh)) is not None:
         # Under TP, the global shape is the TP-local shape. As FSDP2 does, lay
-        # the parameter out on (dp_shard, tp), with Shard on tp for the dim its
-        # TP layout splits; the dp_shard placement then shards within each TP
-        # shard of that dim.
+        # the parameter out on its data-parallel mesh and tp, with Shard on tp
+        # for the dim its TP layout splits; the data-parallel placement then
+        # shards within each TP shard of that dim.
         (fsdp_placement,) = placements
         tp_placement: Shard | Replicate = Replicate()
         if (outer_layout := flex_shard.get_outer_layout(param)) is not None:
@@ -403,7 +411,7 @@ def _as_fsdp2_dtensor(tensor: torch.Tensor, param: torch.Tensor) -> torch.Tensor
             global_shape = torch.Size(outer_layout.global_shape)
         if isinstance(tp_placement, Shard) and tp_placement.dim == fsdp_placement.dim:
             fsdp_placement = _StridedShard(
-                fsdp_placement.dim, split_factor=storage_mesh["tp"].size()
+                fsdp_placement.dim, split_factor=storage_mesh.size(-1)
             )
         placements = (fsdp_placement, tp_placement)
         mesh = storage_mesh
