@@ -180,7 +180,12 @@ class Module(nn.Module, Configurable):
 
         reset = getattr(self, "reset_parameters", None)
         if callable(reset):
-            reset()
+            from torchtitan.distributed.flex_shard_fsdp import fsdp2_dtensor_params
+
+            # As in _init_param: FlexShard's local shards are reset through the
+            # DTensor views FSDP2 would give them.
+            with fsdp2_dtensor_params(self):
+                reset()
             return
 
         own_param_names = [name for name, _ in self.named_parameters(recurse=False)]
