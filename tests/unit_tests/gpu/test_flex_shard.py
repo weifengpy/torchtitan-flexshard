@@ -33,6 +33,11 @@ from torchtitan.config.configs import DebugConfig
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.config.transform import ContextParallelTransform
 from torchtitan.distributed import utils as dist_utils
+from torchtitan.distributed.cuda_graph import (
+    cuda_graph_teardown,
+    NUM_CUDA_GRAPH_WARMUP_STEPS,
+    wrap_fwd_bwd_with_cuda_graph,
+)
 from torchtitan.distributed.fsdp import get_fsdp_group, set_requires_gradient_sync
 from torchtitan.distributed.parallelism_context import ParallelismContext
 from torchtitan.models.common.attention.attention import FlexInnerAttention
@@ -127,6 +132,7 @@ class TestFlexShardDecoder(DTensorTestBase):
         steps=range(3),
         spmd_typechecking=False,
         defer_gradient_reduction=True,
+        cuda_graphs=False,
     ):
         if optim is None:
             optim = torch.optim.AdamW(model.parameters(), lr=1e-3, foreach=True)
@@ -154,6 +160,39 @@ class TestFlexShardDecoder(DTensorTestBase):
             )
             loss_fn.set_lm_head(model.lm_head, get_fsdp_group(model, model.lm_head))
             model._skip_lm_head = True
+
+        def forward_backward(prepared_microbatches) -> torch.Tensor:
+            losses = []
+            for microbatch, (
+                inputs,
+                labels,
+                model_kwargs,
+                global_loss_token_counts,
+            ) in enumerate(prepared_microbatches):
+                # As parallelism.fsdp_defer_gradient_reduction: only the last
+                # microbatch's backward reduces.
+                if microbatches > 1 and defer_gradient_reduction:
+                    set_requires_gradient_sync(model, microbatch == microbatches - 1)
+                with parallelism_context.activate_spmd(typechecking=spmd_typechecking):
+                    output = model(inputs, **model_kwargs)
+                    loss, _ = loss_fn(
+                        output,
+                        labels,
+                        global_loss_token_counts=global_loss_token_counts,
+                    )
+                    with spmd.no_typecheck():
+                        loss.backward()
+                losses.append(loss.detach())
+            return torch.stack(losses)
+
+        if cuda_graphs:
+            # As the trainer with CUDA graphs: eager warmup steps, then one
+            # capture of the forward-backward, replayed in later steps.
+            forward_backward = wrap_fwd_bwd_with_cuda_graph(
+                forward_backward,
+                parameters=model.parameters(),
+                num_warmup_iterations=NUM_CUDA_GRAPH_WARMUP_STEPS,
+            )
         # One packed sequence per microbatch, as the data loader produces. The
         # data-parallel ranks get different data; their CP and TP peers share it.
         seq_len = _seq_len(parallelism_context)
@@ -162,12 +201,8 @@ class TestFlexShardDecoder(DTensorTestBase):
         dp_rank, dp_size = dp_mesh.get_local_rank(), dp_mesh.size()
         history = []
         for step in steps:
-            losses = []
+            prepared_microbatches = []
             for microbatch in range(microbatches):
-                # As parallelism.fsdp_defer_gradient_reduction: only the last
-                # microbatch's backward reduces.
-                if microbatches > 1 and defer_gradient_reduction:
-                    set_requires_gradient_sync(model, microbatch == microbatches - 1)
                 generator = torch.Generator().manual_seed(
                     1000 * step + 10 * microbatch + dp_rank
                 )
@@ -199,16 +234,11 @@ class TestFlexShardDecoder(DTensorTestBase):
                     else [global_token_count] * num_objectives,
                     device=self.device_type,
                 )
-                with parallelism_context.activate_spmd(typechecking=spmd_typechecking):
-                    output = model(inputs, **model_kwargs)
-                    loss, _ = loss_fn(
-                        output,
-                        labels,
-                        global_loss_token_counts=global_loss_token_counts,
-                    )
-                    with spmd.no_typecheck():
-                        loss.backward()
-                losses.append(loss.detach())
+                prepared_microbatches.append(
+                    (inputs, labels, model_kwargs, global_loss_token_counts)
+                )
+            # A replay overwrites the captured step's loss.
+            losses = list(forward_backward(prepared_microbatches).clone())
             grad_norm = dist_utils.clip_grad_norm_(
                 list(model.parameters()),
                 max_norm=1.0,
@@ -223,6 +253,8 @@ class TestFlexShardDecoder(DTensorTestBase):
             optim.step()
             optim.zero_grad()
             history.append((losses, grad_norm, grads, self._local_params(model)))
+        if cuda_graphs:
+            cuda_graph_teardown()
         return history
 
     def _local_params(self, model) -> dict[str, torch.Tensor]:
@@ -246,7 +278,10 @@ class TestFlexShardDecoder(DTensorTestBase):
         chunked_loss=False,
         spmd_typechecking=False,
         defer_gradient_reduction=True,
+        cuda_graphs=False,
     ) -> None:
+        # With CUDA graphs: the warmup steps, the captured step and two replays.
+        steps = range(NUM_CUDA_GRAPH_WARMUP_STEPS + 3 if cuda_graphs else 3)
         for reshard_after_forward, microbatches in configs:
             context = (
                 f"reshard_after_forward={reshard_after_forward} "
@@ -268,16 +303,20 @@ class TestFlexShardDecoder(DTensorTestBase):
                 *fsdp2_setup,
                 microbatches,
                 chunked_loss,
+                steps=steps,
                 spmd_typechecking=spmd_typechecking,
                 defer_gradient_reduction=defer_gradient_reduction,
+                cuda_graphs=cuda_graphs,
             )
             actual_history = self._train(
                 flex,
                 *flex_setup,
                 microbatches,
                 chunked_loss,
+                steps=steps,
                 spmd_typechecking=spmd_typechecking,
                 defer_gradient_reduction=defer_gradient_reduction,
+                cuda_graphs=cuda_graphs,
             )
             self._assert_equal_histories(expected_history, actual_history, context)
 
@@ -344,6 +383,29 @@ class TestFlexShardDecoder(DTensorTestBase):
             [("default", 1)],
             build_deepseek_v3_model_config,
             spmd_typechecking=True,
+        )
+
+    @with_comms
+    def test_matches_fsdp2_with_cuda_graphs(self):
+        # As DeepSeek V3 recipes with CUDA graphs: the chunked loss, with and
+        # without gradient accumulation. EP 1, since the all-to-all token
+        # dispatcher doesn't support CUDA graphs.
+        parallelism_context = ParallelismContext(
+            dp_replicate=1,
+            dp_shard=self.world_size,
+            cp=1,
+            tp=1,
+            pp=1,
+            ep=1,
+            world_size=self.world_size,
+            enable_sequence_parallel=False,
+        )
+        self._check_matches_fsdp2(
+            parallelism_context,
+            [("default", 1), ("default", 2), ("never", 2)],
+            build_deepseek_v3_model_config,
+            chunked_loss=True,
+            cuda_graphs=True,
         )
 
     @with_comms
