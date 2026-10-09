@@ -25,11 +25,7 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 from torch.testing._internal.distributed.checkpoint_utils import with_temp_dir
 
 from torchtitan.components.checkpointer import CheckpointManager
-from torchtitan.components.loss import (
-    ChunkedLossWrapper,
-    cross_entropy_loss,
-    CrossEntropyLoss,
-)
+from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.optim import AdamW, OptimizersContainer
 from torchtitan.config import TrainingConfig
 from torchtitan.config.configs import DebugConfig
@@ -127,10 +123,15 @@ class TestFlexShardDecoder(DTensorTestBase):
         *,
         optim=None,
         steps=range(3),
+        spmd_typechecking=False,
     ):
         if optim is None:
             optim = torch.optim.AdamW(model.parameters(), lr=1e-3, foreach=True)
-        loss_fn = None
+        # As the trainer's loss: vocab-parallel under TP, normalized by the
+        # global token count.
+        loss_fn = CrossEntropyLoss(
+            CrossEntropyLoss.Config(global_vocab_size=model_config.vocab_size)
+        )
         if chunked_loss:
             # As the trainer sets it up: the model returns the hidden states,
             # and the loss applies lm_head to each chunk of them.
@@ -173,28 +174,24 @@ class TestFlexShardDecoder(DTensorTestBase):
                         parallelism=parallelism,
                         max_context_length=seq_len,
                     )
+                # The trainer's global token counts: no padding, so every token
+                # of every microbatch on every data-parallel rank.
+                global_token_count = seq_len * dp_size * microbatches
                 if "aux_loss_denominators" in model_kwargs:
-                    # The trainer's global routed-token count: no padding, so
-                    # every token of every microbatch on every data-parallel
-                    # rank.
                     model_kwargs["aux_loss_denominators"] = torch.tensor(
-                        [seq_len * dp_size * microbatches],
-                        device=self.device_type,
+                        [global_token_count], device=self.device_type
                     )
-                with parallelism_context.activate_spmd():
+                # Created outside the type checker, which would type it R on tp.
+                global_loss_token_counts = torch.tensor(
+                    global_token_count, device=self.device_type
+                )
+                with parallelism_context.activate_spmd(typechecking=spmd_typechecking):
                     output = model(inputs, **model_kwargs)
-                    if loss_fn is None:
-                        # Vocab-parallel under TP, as the trainer's loss.
-                        loss = (
-                            cross_entropy_loss(
-                                output,
-                                labels,
-                                global_vocab_size=model_config.vocab_size,
-                            )
-                            / labels.numel()
-                        )
-                    else:
-                        loss, _ = loss_fn(output, labels)
+                    loss, _ = loss_fn(
+                        output,
+                        labels,
+                        global_loss_token_counts=global_loss_token_counts,
+                    )
                     with spmd.no_typecheck():
                         loss.backward()
                 losses.append(loss.detach())
@@ -233,6 +230,7 @@ class TestFlexShardDecoder(DTensorTestBase):
         configs,
         build_config=build_model_config,
         chunked_loss=False,
+        spmd_typechecking=False,
     ) -> None:
         for reshard_after_forward, microbatches in configs:
             context = (
@@ -251,9 +249,19 @@ class TestFlexShardDecoder(DTensorTestBase):
                 self._local_params(fsdp2), self._local_params(flex), f"{context} init"
             )
             expected_history = self._train(
-                fsdp2, *fsdp2_setup, microbatches, chunked_loss
+                fsdp2,
+                *fsdp2_setup,
+                microbatches,
+                chunked_loss,
+                spmd_typechecking=spmd_typechecking,
             )
-            actual_history = self._train(flex, *flex_setup, microbatches, chunked_loss)
+            actual_history = self._train(
+                flex,
+                *flex_setup,
+                microbatches,
+                chunked_loss,
+                spmd_typechecking=spmd_typechecking,
+            )
             self._assert_equal_histories(expected_history, actual_history, context)
 
     def _assert_equal_histories(
@@ -290,6 +298,10 @@ class TestFlexShardDecoder(DTensorTestBase):
         self._check_matches_fsdp2(
             parallelism_context, product(("default", "always"), (1, 2))
         )
+        # FlexShard's hooks run outside spmd_types' checker, as FSDP2's do.
+        self._check_matches_fsdp2(
+            parallelism_context, [("default", 1)], spmd_typechecking=True
+        )
 
     @with_comms
     def test_matches_fsdp2_with_expert_parallelism(self):
@@ -309,6 +321,12 @@ class TestFlexShardDecoder(DTensorTestBase):
             parallelism_context,
             [("default", 1), ("default", 2)],
             build_deepseek_v3_model_config,
+        )
+        self._check_matches_fsdp2(
+            parallelism_context,
+            [("default", 1)],
+            build_deepseek_v3_model_config,
+            spmd_typechecking=True,
         )
 
     @with_comms
@@ -544,6 +562,9 @@ class TestFlexShardDecoder(DTensorTestBase):
         self._check_matches_fsdp2(
             parallelism_context, [("default", 1), ("default", 2)], chunked_loss=True
         )
+        self._check_matches_fsdp2(
+            parallelism_context, [("default", 1)], spmd_typechecking=True
+        )
 
     @with_comms
     def test_matches_fsdp2_with_tensor_parallelism_without_sequence_parallelism(
@@ -568,8 +589,12 @@ class TestFlexShardDecoder(DTensorTestBase):
     def test_matches_fsdp2_with_context_parallelism(self):
         # Parameters shard over dp_shard x cp, flattened as fully_shard does,
         # and the reduce-scatter sums the grads of every sequence chunk.
+        parallelism_context = self._context(cp=2)
         self._check_matches_fsdp2(
-            self._context(cp=2), product(("default", "always"), (1, 2))
+            parallelism_context, product(("default", "always"), (1, 2))
+        )
+        self._check_matches_fsdp2(
+            parallelism_context, [("default", 1)], spmd_typechecking=True
         )
 
     @with_comms
