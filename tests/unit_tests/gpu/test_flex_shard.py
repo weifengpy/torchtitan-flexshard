@@ -6,6 +6,7 @@
 
 """``parallelism.fsdp_backend='flex_shard'`` against FSDP2, bit for bit."""
 
+import functools
 import os
 from itertools import product
 from typing import Any, cast
@@ -41,6 +42,7 @@ from torchtitan.models.common.attention.cp_attention import (
 from torchtitan.models.deepseek_v3 import (
     build_model_config as build_deepseek_v3_model_config,
 )
+from torchtitan.models.deepseek_v3.mtp import MTPLoss
 from torchtitan.models.llama3 import build_model_config
 
 flex_shard = pytest.importorskip("flex_shard")
@@ -124,13 +126,20 @@ class TestFlexShardDecoder(DTensorTestBase):
         optim=None,
         steps=range(3),
         spmd_typechecking=False,
+        defer_gradient_reduction=True,
     ):
         if optim is None:
             optim = torch.optim.AdamW(model.parameters(), lr=1e-3, foreach=True)
         # As the trainer's loss: vocab-parallel under TP, normalized by the
-        # global token count.
-        loss_fn = CrossEntropyLoss(
-            CrossEntropyLoss.Config(global_vocab_size=model_config.vocab_size)
+        # global token count, with one objective per MTP layer.
+        mtp_layers = getattr(model, "mtp_layers", None)
+        num_objectives = 1 + (0 if mtp_layers is None else len(mtp_layers))
+        loss_fn = (
+            CrossEntropyLoss(
+                CrossEntropyLoss.Config(global_vocab_size=model_config.vocab_size)
+            )
+            if num_objectives == 1
+            else MTPLoss(MTPLoss.Config(global_vocab_size=model_config.vocab_size))
         )
         if chunked_loss:
             # As the trainer sets it up: the model returns the hidden states,
@@ -155,7 +164,9 @@ class TestFlexShardDecoder(DTensorTestBase):
         for step in steps:
             losses = []
             for microbatch in range(microbatches):
-                if microbatches > 1:
+                # As parallelism.fsdp_defer_gradient_reduction: only the last
+                # microbatch's backward reduces.
+                if microbatches > 1 and defer_gradient_reduction:
                     set_requires_gradient_sync(model, microbatch == microbatches - 1)
                 generator = torch.Generator().manual_seed(
                     1000 * step + 10 * microbatch + dp_rank
@@ -179,11 +190,14 @@ class TestFlexShardDecoder(DTensorTestBase):
                 global_token_count = seq_len * dp_size * microbatches
                 if "aux_loss_denominators" in model_kwargs:
                     model_kwargs["aux_loss_denominators"] = torch.tensor(
-                        [global_token_count], device=self.device_type
+                        [global_token_count] * num_objectives, device=self.device_type
                     )
                 # Created outside the type checker, which would type it R on tp.
                 global_loss_token_counts = torch.tensor(
-                    global_token_count, device=self.device_type
+                    global_token_count
+                    if num_objectives == 1
+                    else [global_token_count] * num_objectives,
+                    device=self.device_type,
                 )
                 with parallelism_context.activate_spmd(typechecking=spmd_typechecking):
                     output = model(inputs, **model_kwargs)
@@ -231,6 +245,7 @@ class TestFlexShardDecoder(DTensorTestBase):
         build_config=build_model_config,
         chunked_loss=False,
         spmd_typechecking=False,
+        defer_gradient_reduction=True,
     ) -> None:
         for reshard_after_forward, microbatches in configs:
             context = (
@@ -254,6 +269,7 @@ class TestFlexShardDecoder(DTensorTestBase):
                 microbatches,
                 chunked_loss,
                 spmd_typechecking=spmd_typechecking,
+                defer_gradient_reduction=defer_gradient_reduction,
             )
             actual_history = self._train(
                 flex,
@@ -261,6 +277,7 @@ class TestFlexShardDecoder(DTensorTestBase):
                 microbatches,
                 chunked_loss,
                 spmd_typechecking=spmd_typechecking,
+                defer_gradient_reduction=defer_gradient_reduction,
             )
             self._assert_equal_histories(expected_history, actual_history, context)
 
@@ -572,6 +589,25 @@ class TestFlexShardDecoder(DTensorTestBase):
         self._check_matches_fsdp2(
             self._context(cp=2, tp=2, sp=True), [("default", 1), ("default", 2)]
         )
+
+    @with_comms
+    def test_matches_fsdp2_with_multi_token_prediction(self):
+        # DeepSeek V3's MTP layer shards like a block after the decoder's, with
+        # its routed experts on edp_shard. lm_head runs twice per forward, so
+        # with deferred reduction its kept grads are reduce-scattered on their
+        # own, as FSDP2's first post-backward of the two does.
+        parallelism_context = self._context(ep=2)
+        build_config = functools.partial(
+            build_deepseek_v3_model_config, num_mtp_layers=1
+        )
+        # Every backward reduces, as the trainer's do by default.
+        self._check_matches_fsdp2(
+            parallelism_context,
+            [("default", 1), ("default", 2)],
+            build_config,
+            defer_gradient_reduction=False,
+        )
+        self._check_matches_fsdp2(parallelism_context, [("default", 2)], build_config)
 
     @with_comms
     def test_matches_fsdp2_with_tensor_parallelism_without_sequence_parallelism(
