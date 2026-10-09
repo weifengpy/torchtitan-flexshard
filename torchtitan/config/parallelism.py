@@ -257,7 +257,6 @@ class ParallelismConfig:
                         "data_parallel_replicate_degree",
                         self.data_parallel_replicate_degree,
                     ),
-                    ("tensor_parallel_degree", self.tensor_parallel_degree),
                     ("pipeline_parallel_degree", self.pipeline_parallel_degree),
                 )
                 if degree != 1
@@ -266,11 +265,13 @@ class ParallelismConfig:
                 unsupported.append(
                     f"parallelism.fsdp_symm_mem_scope={self.fsdp_symm_mem_scope!r}"
                 )
+            if self.tensor_parallel_degree > 1 and self.context_parallel_degree > 1:
+                unsupported.append("tensor and context parallelism together")
             if unsupported:
                 raise ValueError(
                     "parallelism.fsdp_backend='flex_shard' supports only data "
-                    "parallelism over data_parallel_shard_degree, with expert "
-                    "and context parallelism, so far; it does not support "
+                    "parallelism over data_parallel_shard_degree, with expert, "
+                    "context or tensor parallelism, so far; it does not support "
                     f"{', '.join(unsupported)}."
                 )
         if self.fsdp_symm_mem_scope is not None and (
