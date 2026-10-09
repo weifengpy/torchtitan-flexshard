@@ -18,8 +18,8 @@ mesh, and the block gets one bucket per group. FlexShard is imported only when
 import contextlib
 import logging
 import sys
-from collections.abc import Callable, Iterable, Iterator, Sequence
-from typing import Any, cast, TYPE_CHECKING
+from collections.abc import Iterable, Iterator, Sequence
+from typing import cast, TYPE_CHECKING
 
 import spmd_types as spmd
 import torch
@@ -40,8 +40,6 @@ from torchtitan.distributed.parallelism_context import MeshAxisName
 from torchtitan.distributed.spmd_types import _per_axis_types, spmd_axes
 
 if TYPE_CHECKING:
-    from torch.distributed.pipelining import PipelineStage
-
     from torchtitan.models.common.decoder import Decoder
     from torchtitan.models.common.moe import MoE
 
@@ -421,41 +419,21 @@ class _FSDPModuleOrFlexShard(metaclass=_FSDPModuleOrFlexShardMeta):
     """Matches FSDP2 and FlexShard modules in ``isinstance`` checks."""
 
 
-class _CompletedUnshardHandle:
-    def wait(self) -> None:
-        pass
-
-
-def _unshard_with_async_op(
-    unshard: Callable[[], None],
-) -> Callable[..., _CompletedUnshardHandle | None]:
-    def unshard_with_async_op(async_op: bool = False) -> _CompletedUnshardHandle | None:
-        unshard()
-        return _CompletedUnshardHandle() if async_op else None
-
-    return unshard_with_async_op
-
-
-def enable_pipelining(stages: Sequence["PipelineStage"]) -> None:
-    """Let ``torch.distributed.pipelining`` drive the FlexShard modules of
-    ``stages`` as it drives FSDP2's.
+def enable_pipelining() -> None:
+    """Let ``torch.distributed.pipelining`` drive FlexShard modules as it
+    drives FSDP2's.
 
     PyTorch's pipeline stages and schedules treat a stage module as data
     parallel only if it is an ``FSDPModule``. A FlexShard module has every
     method they call: ``set_manual_backward_finalization``,
     ``set_requires_gradient_sync``, ``set_reshard_after_backward``,
-    ``finalize_backward(async_op=True)``, ``unshard`` and ``reshard``. Their
-    ``isinstance`` checks therefore match FlexShard modules too, and two gaps
-    are bridged:
-
-    - Multi-stage schedules unshard ahead with ``unshard(async_op=True)``.
-      FlexShard's ``unshard()`` takes no ``async_op`` and gathers
-      synchronously, so each stage module gets an ``unshard`` that accepts it
-      and returns a completed handle.
-    - ``defer_reduce_grad_wait`` checks that no two FSDP2 stages share a
-      communication context, reading FSDP2's state. FlexShard keeps its
-      contexts on each stage's root module, so its stages can't share one, and
-      the check covers FSDP2's stages only.
+    ``finalize_backward(async_op=True)``, ``unshard(async_op=True)``, with
+    which multi-stage schedules gather a stage ahead of its forward, and
+    ``reshard``. Their ``isinstance`` checks therefore match FlexShard modules
+    too. ``defer_reduce_grad_wait`` also checks that no two FSDP2 stages share
+    a communication context, reading FSDP2's state. FlexShard keeps its
+    contexts on each stage's root module, so its stages can't share one, and
+    the check covers FSDP2's stages only.
 
     TODO: remove once ``torch.distributed.pipelining`` checks for the methods
     it calls rather than for ``FSDPModule``.
@@ -479,10 +457,6 @@ def enable_pipelining(stages: Sequence["PipelineStage"]) -> None:
                 schedules.FSDPModule = _FSDPModuleOrFlexShard
 
         runtime._validate_deferred_gradient_reduction = validate_fsdp2_stages
-    for stage in stages:
-        module = cast(Any, stage.submod)
-        if hasattr(module, "bucket_storage_of") and "unshard" not in vars(module):
-            module.unshard = _unshard_with_async_op(module.unshard)
 
 
 def grads_for_norm(parameters: Iterable[torch.Tensor]) -> list[torch.Tensor]:
