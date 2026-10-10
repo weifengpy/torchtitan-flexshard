@@ -157,6 +157,9 @@ def test_flex_shard_checkpointing() -> None:
         CheckpointManager.Config(),
         CheckpointManager.Config(async_mode="async"),
         CheckpointManager.Config(export_dtype="bfloat16"),
+        CheckpointManager.Config(
+            initial_load_in_hf=True, initial_load_path="/checkpoint"
+        ),
     ):
         config.checkpointer = checkpointer
         TrainingEngine.Config.__post_init__(config)
@@ -168,13 +171,15 @@ def test_flex_shard_checkpointing() -> None:
         ),
         (
             CheckpointManager.Config(last_save_in_hf=True),
-            "Hugging Face checkpoints",
+            "Hugging Face checkpoint saves",
         ),
         (
             CheckpointManager.Config(
-                initial_load_in_hf=True, initial_load_path="/checkpoint"
+                initial_load_in_hf=True,
+                initial_load_in_hf_quantized=True,
+                initial_load_path="/checkpoint",
             ),
-            "Hugging Face checkpoints",
+            "quantized loads",
         ),
         (
             TorchCheckpointingManager.Config(),
