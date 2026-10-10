@@ -38,6 +38,10 @@ from torchtitan.distributed.cuda_graph import (
     NUM_CUDA_GRAPH_WARMUP_STEPS,
     wrap_fwd_bwd_with_cuda_graph,
 )
+from torchtitan.distributed.flex_shard_fsdp import (
+    as_flex_shard_state_dict,
+    as_fsdp2_state_dict,
+)
 from torchtitan.distributed.fsdp import get_fsdp_group, set_requires_gradient_sync
 from torchtitan.distributed.parallelism_context import ParallelismContext
 from torchtitan.models.common.attention.attention import FlexInnerAttention
@@ -48,6 +52,7 @@ from torchtitan.models.deepseek_v3 import (
     build_model_config as build_deepseek_v3_model_config,
 )
 from torchtitan.models.deepseek_v3.mtp import MTPLoss
+from torchtitan.models.deepseek_v3.state_dict_adapter import DeepSeekV3StateDictAdapter
 from torchtitan.models.llama3 import build_model_config
 
 flex_shard = pytest.importorskip("flex_shard")
@@ -453,7 +458,7 @@ class TestFlexShardDecoder(DTensorTestBase):
         )
 
     def _checkpointer(
-        self, model, optimizers, folder: str, **config
+        self, model, optimizers, folder: str, *, sd_adapter=None, **config
     ) -> CheckpointManager:
         return CheckpointManager(
             CheckpointManager.Config(
@@ -465,7 +470,7 @@ class TestFlexShardDecoder(DTensorTestBase):
             lr_schedulers=cast(Any, None),
             ema=None,
             states={},
-            sd_adapter=None,
+            sd_adapter=sd_adapter,
         )
 
     def _local_state(self, model, optimizers) -> dict[str, torch.Tensor]:
@@ -603,6 +608,78 @@ class TestFlexShardDecoder(DTensorTestBase):
                 f"{context}, saved after the resume",
             )
 
+    def _check_hf_load_matches_fsdp2(self, parallelism_context) -> None:
+        build_config = build_deepseek_v3_model_config
+        model, model_config, *setup = self._build(
+            "fsdp2", "default", parallelism_context, build_config
+        )
+        optimizers = self._optimizers(model)
+        # A step makes the weights differ from the initialization the loading
+        # models start from, so a load that does nothing fails.
+        self._train(
+            model, model_config, *setup, 1, False, optim=optimizers, steps=range(1)
+        )
+        expected = self._local_params(model)
+        export_folder = os.path.join(self.temp_dir, "export")
+        checkpointer = self._checkpointer(
+            model,
+            optimizers,
+            export_folder,
+            sd_adapter=DeepSeekV3StateDictAdapter(model_config, None),
+            last_save_model_only=True,
+            last_save_in_hf=True,
+            export_dtype="float32",
+        )
+        checkpointer.save(1, last_step=True)
+        checkpointer.close()
+
+        models = {}
+        for backend in ("fsdp2", "flex_shard"):
+            model, model_config, *_ = self._build(
+                backend, "default", parallelism_context, build_config
+            )
+            checkpointer = self._checkpointer(
+                model,
+                self._optimizers(model),
+                os.path.join(self.temp_dir, backend),
+                sd_adapter=DeepSeekV3StateDictAdapter(model_config, None),
+                initial_load_path=os.path.join(export_folder, "step-1"),
+                initial_load_in_hf=True,
+            )
+            self.assertTrue(checkpointer.load())
+            checkpointer.close()
+            models[backend] = model
+        # FlexShard's parameters reach the adapter as views of the chunks
+        # FlexShard declares to DCP, and from_hf returns them with the views'
+        # placements, so the load redistributes nothing.
+        flex = models["flex_shard"]
+        state_dict = flex.state_dict()
+        views = as_fsdp2_state_dict([flex], state_dict)
+        adapter = DeepSeekV3StateDictAdapter(model_config, None)
+        round_trip = adapter.from_hf(adapter.to_hf(views))
+        local_round_trip = as_flex_shard_state_dict([flex], round_trip)
+
+        for backend, model in models.items():
+            self._assert_equal_tensors(
+                expected, self._local_params(model), f"{backend} loaded"
+            )
+        layouts = flex_shard.get_flex_shard_global_layouts(flex)
+        self.assertEqual(sorted(layouts), sorted(expected))
+        for fqn, layout in layouts.items():
+            view = views[fqn]
+            chunks = [
+                (tuple(chunk.offsets), tuple(chunk.sizes))
+                for chunk in view.__create_chunk_list__()
+            ]
+            regions = list(zip(layout.global_offsets, layout.local_sizes, strict=True))
+            self.assertEqual(
+                (tuple(view.shape), chunks), (layout.global_shape, regions), msg=fqn
+            )
+            self.assertEqual(round_trip[fqn].placements, view.placements, msg=fqn)
+            self.assertTrue(
+                torch.equal(local_round_trip[fqn], state_dict[fqn]), msg=fqn
+            )
+
     @with_comms
     @with_temp_dir
     def test_checkpoints_match_fsdp2(self):
@@ -718,6 +795,18 @@ class TestFlexShardDecoder(DTensorTestBase):
         self._check_resumes_across_backends(
             self._context(ep=2), build_deepseek_v3_model_config
         )
+
+    @with_comms
+    @with_temp_dir
+    def test_hf_load_matches_fsdp2_with_expert_parallelism(self):
+        # The routed experts also shard over edp_shard, two ranks per ep shard.
+        self._check_hf_load_matches_fsdp2(self._context(ep=2))
+
+    @with_comms
+    @with_temp_dir
+    def test_hf_load_matches_fsdp2_with_one_rank_edp_shard(self):
+        # ep spans all ranks, so the routed experts' edp_shard axis has one rank.
+        self._check_hf_load_matches_fsdp2(self._context(ep=4))
 
 
 def _chunks(metadata: TensorStorageMetadata) -> list[tuple[tuple[int, ...], ...]]:

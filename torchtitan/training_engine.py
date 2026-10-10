@@ -184,13 +184,13 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                             and self.checkpointer.async_mode == "async_with_pinned_mem",
                         ),
                         (
-                            "Hugging Face checkpoints (checkpointer."
-                            "initial_load_in_hf or last_save_in_hf), whose "
-                            "conversion needs full tensors",
+                            "Hugging Face checkpoint saves (checkpointer."
+                            "last_save_in_hf) or quantized loads (checkpointer."
+                            "initial_load_in_hf_quantized)",
                             self.checkpointer is not None
                             and (
-                                self.checkpointer.initial_load_in_hf
-                                or self.checkpointer.last_save_in_hf
+                                self.checkpointer.last_save_in_hf
+                                or self.checkpointer.initial_load_in_hf_quantized
                             ),
                         ),
                         ("optim.ema", self.optim.ema is not None),
