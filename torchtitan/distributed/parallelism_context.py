@@ -283,12 +283,18 @@ class ParallelismContext:
         ):
             """Unflatten the world mesh to create the required mesh axes.
 
-            Uses the fake backend for inactive axes to avoid unnecessary
-            process-group creation.
+            Uses the fake backend for inactive axes, and for a size-1
+            ``edp_shard`` axis, to avoid unnecessary process-group creation.
             """
             backend_override = {}
             for axis, degree in zip(axis_names, axis_degrees, strict=True):
-                if not self._axis_is_active(axis, degree):
+                # A size-1 edp_shard axis stays active so FSDP can apply mixed
+                # precision to routed experts, but FSDP2 and FlexShard run no
+                # collectives over a 1-rank group, and DTensor skips size-1
+                # axes, so it needs no NCCL communicator.
+                if not self._axis_is_active(axis, degree) or (
+                    axis == "edp_shard" and degree == 1
+                ):
                     backend_override[axis] = "fake"
 
             return world_mesh._unflatten(
