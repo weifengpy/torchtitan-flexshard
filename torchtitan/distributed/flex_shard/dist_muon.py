@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import heapq
 import math
+import os
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
@@ -179,7 +180,18 @@ class DistMuon(Optimizer):
         eps: float = 1e-7,
         ns_steps: int = 5,
         adjust_lr_fn: str | None = None,
+        ranks_per_host: int | None = None,
     ) -> None:
+        if ranks_per_host is not None and ranks_per_host <= 0:
+            raise ValueError(f"ranks_per_host must be positive, got {ranks_per_host}")
+        # Owner placement spreads whole matrices across hosts first (see
+        # _host_interleaved_order). torchrun's LOCAL_WORLD_SIZE is the number of
+        # ranks per host; without it, every rank counts as its own host.
+        self._ranks_per_host = (
+            ranks_per_host
+            if ranks_per_host is not None
+            else int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
+        )
         defaults = {
             "lr": lr,
             "weight_decay": weight_decay,
@@ -323,6 +335,7 @@ class DistMuon(Optimizer):
             resolve_redistribution_plans=partial(
                 _resolve_muon_redistribution_plans,
                 ns_steps_by_group=ns_steps_by_group,
+                ranks_per_host=self._ranks_per_host,
             ),
         )
 
@@ -910,6 +923,7 @@ def _resolve_muon_redistribution_plans(
     contexts: tuple[_BucketPlanningContext[_ParameterComputeLayout], ...],
     *,
     ns_steps_by_group: Sequence[int],
+    ranks_per_host: int,
 ) -> tuple[tuple[_RedistributionPlan | None, ...], ...]:
     """Resolve Muon compute shardings directly into transport plans."""
     cumulative_loads_by_participants: dict[tuple[int, ...], tuple[int, ...]] = {}
@@ -926,6 +940,7 @@ def _resolve_muon_redistribution_plans(
             participants=participants,
             cumulative_loads=initial_loads,
             ns_steps_by_group=ns_steps_by_group,
+            ranks_per_host=ranks_per_host,
         )
         cumulative_loads_by_participants[participants] = cumulative_loads
         bucket_specs = []
@@ -963,8 +978,14 @@ def _assign_balanced_owner_ranks(
     participants: tuple[int, ...],
     cumulative_loads: Sequence[int],
     ns_steps_by_group: Sequence[int],
+    ranks_per_host: int,
 ) -> tuple[tuple[int | None, ...], tuple[int, ...]]:
-    """Balance temporary compute ownership within and across ordered buckets."""
+    """Balance temporary compute ownership within and across ordered buckets.
+
+    Equally loaded participants are taken host by host, so the largest matrices
+    land on different hosts rather than on one host's first ranks. Moving a
+    whole matrix to another owner doesn't change its update.
+    """
     assignments: list[int | None] = [None] * len(compute_layouts)
     candidates = tuple(
         (index, layout)
@@ -984,6 +1005,7 @@ def _assign_balanced_owner_ranks(
             for _index, layout in candidates
         ),
         initial_cumulative_primary_loads=cumulative_loads,
+        partition_order=_host_interleaved_order(participants, ranks_per_host),
     )
     for (index, _layout), partition in zip(
         candidates,
@@ -1005,22 +1027,43 @@ def _estimate_muon_compute_cost(
     return num_matrices * ns_steps * short_dim * short_dim * (2 * long_dim + short_dim)
 
 
+def _host_interleaved_order(
+    participants: Sequence[int], ranks_per_host: int
+) -> tuple[int, ...]:
+    """Each participant's position in the order that takes one rank from every
+    host before a second one from any: by local rank, then by host, with hosts
+    of ``ranks_per_host`` consecutive global ranks, as torchrun numbers them."""
+    ordered = sorted(
+        range(len(participants)),
+        key=lambda partition: (
+            participants[partition] % ranks_per_host,
+            participants[partition] // ranks_per_host,
+        ),
+    )
+    positions = [0] * len(participants)
+    for position, partition in enumerate(ordered):
+        positions[partition] = position
+    return tuple(positions)
+
+
 def _balance_loads_across_partitions(
     loads: Sequence[tuple[int, int, str]],
     *,
     initial_cumulative_primary_loads: Sequence[int],
+    partition_order: Sequence[int],
 ) -> tuple[tuple[int, ...], tuple[int, ...]]:
     """Balance keyed loads with a deterministic LPT heuristic.
 
     Each load is ``(primary, secondary, stable_key)``. Assignments are
     partition indices aligned with those loads. Each call balances its primary
-    and then secondary loads before cumulative primary load. Stable keys make
-    ordering deterministic. This is not an exact partition optimum.
+    and then secondary loads before cumulative primary load, and breaks the
+    remaining ties by ``partition_order``, each partition's position. Stable
+    keys make ordering deterministic. This is not an exact partition optimum.
     """
     num_partitions = len(initial_cumulative_primary_loads)
     assignments = [0] * len(loads)
     partition_loads = [
-        (0, 0, cumulative_load, partition)
+        (0, 0, cumulative_load, partition_order[partition], partition)
         for partition, cumulative_load in enumerate(initial_cumulative_primary_loads)
     ]
     heapq.heapify(partition_loads)
@@ -1037,6 +1080,7 @@ def _balance_loads_across_partitions(
             current_primary,
             current_secondary,
             cumulative_primary,
+            order,
             partition,
         ) = heapq.heappop(partition_loads)
         assignments[load_index] = partition
@@ -1046,12 +1090,13 @@ def _balance_loads_across_partitions(
                 current_primary + primary,
                 current_secondary + secondary,
                 cumulative_primary + primary,
+                order,
                 partition,
             ),
         )
 
     updated_cumulative_primary_loads = [0] * num_partitions
-    for _primary, _secondary, cumulative_primary, partition in partition_loads:
+    for _primary, _secondary, cumulative_primary, _order, partition in partition_loads:
         updated_cumulative_primary_loads[partition] = cumulative_primary
     return tuple(assignments), tuple(updated_cumulative_primary_loads)
 
