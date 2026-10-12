@@ -16,7 +16,9 @@ The public API is exported from `torchtitan.distributed.flex_shard`:
 - `BlockShard` shards complete contiguous blocks along one tensor dimension. It
   preserves the tensor's rank and global shape and never creates a tensor view.
 - `Owned` assigns a complete subgroup-local logical tensor to one dynamically
-  selected rank for the compute phase.
+  selected rank for the compute phase. With `block_sizes`, as for
+  `BlockShard`, the owner treats the blocks of tensor dimension 0 as
+  independent matrices, e.g. per attention head.
 - `BucketConfig` groups and orders parameters by fully qualified name for
   packed redistribution and communication-compute overlap.
 - `BlockShard.block_sizes` is a nonempty tuple describing a repeating sequence
@@ -25,8 +27,9 @@ The public API is exported from `torchtitan.distributed.flex_shard`:
   384 rows into four blocks of 128, 64, 128, and 64 rows. Blocks are distributed
   by count, so ranks can own different numbers of rows. DistMuon runs
   Newton-Schulz and the aspect-ratio learning-rate adjustment independently
-  for each block. Kimi's shared `wkv_a` projection uses `(512, 64)` to distribute
-  its KV latent and RoPE key matrices separately.
+  for each block. Kimi's shared `wkv_a` projection uses `Owned` with
+  `block_sizes=(512, 64)` to compute its KV latent and RoPE key matrices
+  separately on one owner.
 - `DistMuon` consumes optimizer-agnostic per-parameter `ComputeLayout`
   values in `compute_sharding_by_fqn`. DistMuon's `BlockShard` path accepts
   only a 2D parameter with contiguous local DTensor storage. The placement
@@ -43,6 +46,9 @@ The public API is exported from `torchtitan.distributed.flex_shard`:
   rank. A single 2D matrix without
   `BlockShard` uses whole-matrix compute such as `Owned`. The builder validates
   named DTensor parameters and plans their storage-to-compute transitions.
+- DistMuon balances `Owned` parameters over the ranks of each bucket's mesh,
+  hosts first, carrying loads from bucket to bucket. `owner_by_fqn` fixes some
+  parameters' owners instead, as ranks on that mesh axis.
 
 Storage placements describe persistent ownership only; they do not define
 Muon matrix boundaries. Flat matrix-batch compute supports `BlockShard` on at
