@@ -18,6 +18,20 @@ from torch.distributed.tensor import Replicate, Shard
 __all__ = ["BlockShard", "BucketConfig", "ComputeLayout", "Owned"]
 
 
+def _validate_block_sizes(block_sizes: object, owner: str) -> None:
+    if (
+        not isinstance(block_sizes, tuple)
+        or not block_sizes
+        or any(
+            isinstance(size, bool) or not isinstance(size, int) or size <= 0
+            for size in block_sizes
+        )
+    ):
+        raise ValueError(
+            f"{owner}.block_sizes must be a nonempty tuple of positive integers"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class Owned:
     """Assign the complete subgroup-local logical tensor to one owner rank.
@@ -26,9 +40,19 @@ class Owned:
     only during the compute phase; this is not persistent DTensor storage
     ownership. Multiple mesh axes using ``Owned`` select one owner rank from
     their Cartesian product.
+
+    With ``block_sizes``, the owner treats the blocks of tensor dimension 0, of
+    sizes from that repeating sequence, as independent matrices, as
+    ``BlockShard`` does: e.g. per attention head, while one rank holds the whole
+    tensor. ``None`` computes the whole tensor: one matrix, or a batch of
+    matrices along its leading dimensions.
     """
 
-    pass
+    block_sizes: tuple[int, ...] | None = None
+
+    def __post_init__(self) -> None:
+        if self.block_sizes is not None:
+            _validate_block_sizes(self.block_sizes, "Owned")
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,17 +78,7 @@ class BlockShard:
     def __post_init__(self) -> None:
         if isinstance(self.dim, bool) or not isinstance(self.dim, int):
             raise ValueError("BlockShard.dim must be an integer")
-        if (
-            not isinstance(self.block_sizes, tuple)
-            or not self.block_sizes
-            or any(
-                isinstance(size, bool) or not isinstance(size, int) or size <= 0
-                for size in self.block_sizes
-            )
-        ):
-            raise ValueError(
-                "BlockShard.block_sizes must be a nonempty tuple of positive integers"
-            )
+        _validate_block_sizes(self.block_sizes, "BlockShard")
 
     def num_blocks(self, dim_size: int) -> int:
         """Return the block count for a dimension containing whole repetitions."""
