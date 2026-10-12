@@ -19,7 +19,7 @@ import contextlib
 import logging
 import re
 import sys
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from typing import cast, TYPE_CHECKING
 
 import spmd_types as spmd
@@ -51,6 +51,7 @@ __all__ = [
     "enable_pipelining",
     "fsdp2_dtensor_params",
     "grads_for_norm",
+    "owned_placement_fn",
     "relayout_owned_buckets",
 ]
 
@@ -545,24 +546,34 @@ def _owner_grad_for_norm(param: torch.Tensor) -> torch.Tensor:
     )
 
 
-def relayout_owned_buckets(
-    model: nn.Module, owned_param_patterns: Sequence[str]
-) -> None:
-    """Move the buckets ``apply_flex_shard_to_decoder`` made for
-    ``owned_param_patterns`` to whole-parameter owners, once, after
-    initialization or loading: each parameter whole on one rank of its bucket's
-    mesh, owners balanced over hosts first, then over ranks within a host.
-    Values move bitwise."""
-    # pyrefly: ignore [missing-import]
-    from flex_shard import relayout_bucket
-
+def owned_placement_fn() -> Callable:
+    """The placement of owned buckets: each parameter whole on one rank of
+    its bucket's mesh, owners balanced over hosts first, then over ranks
+    within a host, carrying each rank's load from bucket to bucket. Share one
+    across a rank's model parts, so virtual stages balance together too."""
     # pyrefly: ignore [missing-import]
     from flex_shard.custom_placements.owned import (
         make_bucketed_owned_full_param_placement_fn,
     )
 
+    return make_bucketed_owned_full_param_placement_fn(carry_loads=True)
+
+
+def relayout_owned_buckets(
+    model: nn.Module,
+    owned_param_patterns: Sequence[str],
+    placement_fn: Callable | None = None,
+) -> None:
+    """Move the buckets ``apply_flex_shard_to_decoder`` made for
+    ``owned_param_patterns`` to whole-parameter owners (``owned_placement_fn``,
+    or ``placement_fn``), once, after initialization or loading. Values move
+    bitwise."""
+    # pyrefly: ignore [missing-import]
+    from flex_shard import relayout_bucket
+
     patterns = [re.compile(pattern) for pattern in owned_param_patterns]
-    placement_fn = make_bucketed_owned_full_param_placement_fn()
+    if placement_fn is None:
+        placement_fn = owned_placement_fn()
     # pyrefly: ignore [missing-attribute]
     for storage in list(model.sharded_bucket_storages):
         owned = [

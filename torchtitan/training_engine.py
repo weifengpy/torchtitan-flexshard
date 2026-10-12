@@ -408,18 +408,24 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             self.pp_has_first_stage = True
             self.pp_has_last_stage = True
 
+        owned_params = config.parallelism.flex_shard_owned_params
+        owned_placement = None
+        if owned_params:
+            from torchtitan.distributed.flex_shard_fsdp import owned_placement_fn
+
+            # One for every model part: owners balance across virtual stages.
+            owned_placement = owned_placement_fn()
         with self.parallelism_context.activate_spmd():
             for model_part in self.model_parts:
                 model_part.to_empty(device=init_device)
                 with torch.no_grad():
                     model_part.init_weights(buffer_device=buffer_device)
-                owned_params = config.parallelism.flex_shard_owned_params
                 if owned_params and hasattr(model_part, "sharded_bucket_storages"):
                     from torchtitan.distributed.flex_shard_fsdp import (
                         relayout_owned_buckets,
                     )
 
-                    relayout_owned_buckets(model_part, owned_params)
+                    relayout_owned_buckets(model_part, owned_params, owned_placement)
                 model_part.train()
 
         if isinstance(self.loss_fn, ChunkedLossWrapper) and (
