@@ -75,6 +75,8 @@ def apply_flex_shard_to_decoder(
     ep_degree: int = 1,
     edp_mesh: DeviceMesh | None = None,
     extra_blocks: Sequence[tuple[str, nn.Module]] = (),
+    blockwise_fp8: bool = False,
+    blockwise_fp8_dense_reference: bool = False,
 ) -> None:
     """Shard a decoder with FlexShard as ``apply_fsdp_to_decoder`` does with FSDP2.
 
@@ -113,6 +115,12 @@ def apply_flex_shard_to_decoder(
         extra_blocks: Transformer blocks outside ``model.layers``, by FQN, each
             sharded like a block after the last one, e.g. DeepSeek V3's MTP
             layers, which ``apply_fsdp_to_mtp_decoder`` appends to the layers.
+        blockwise_fp8: Whether ``convert_blockwise_fp8_linears`` converted
+            linears, which then all-gather blockwise FP8. A block holding them
+            gets a mixed bucket in place of its dense ``fsdp2_compatible`` one.
+        blockwise_fp8_dense_reference: As ``blockwise_fp8``, but the converted
+            linears all-gather bf16 and are quantized after the gather, with
+            the same layout: the A/B reference for ``blockwise_fp8``.
     """
     # flex_shard is an optional dependency, needed only for this backend.
     # pyrefly: ignore [missing-import]
@@ -170,29 +178,46 @@ def apply_flex_shard_to_decoder(
             for fqn, param in named_params
         }
 
+    fp8_weights: set[nn.Parameter] = set()
+    mixed_placement_fn = None
+    if blockwise_fp8 or blockwise_fp8_dense_reference:
+        from torchtitan.distributed import flex_shard_blockwise_fp8
+
+        fp8_weights = flex_shard_blockwise_fp8.blockwise_fp8_weights(model)
+        mixed_placement_fn = flex_shard_blockwise_fp8.make_mixed_placement_fn(
+            model, placement_fn, dense_reference=blockwise_fp8_dense_reference
+        )
+
     buckets: list[BucketSpec] = []
     bucketed_params: set[nn.Parameter] = set()
 
     def add_bucket(
-        patterns: list[str], reshard_after_forward: bool, mesh: DeviceMesh = dp_mesh
+        patterns: list[str],
+        reshard_after_forward: bool,
+        mesh: DeviceMesh = dp_mesh,
+        *,
+        mixed: bool = False,
     ) -> int:
         buckets.append(
             BucketSpec(
                 patterns,
-                placement_fn=placement_fn,
+                placement_fn=mixed_placement_fn if mixed else placement_fn,
                 mesh=mesh,
                 mp_policy=mp_policy,
                 gradient_divide_factor=1.0,
                 reshard_after_forward=reshard_after_forward,
-                fsdp2_compatible=True,
+                # fsdp2_compatible requires Shard placements.
+                fsdp2_compatible=not mixed,
             )
         )
         return len(buckets) - 1
 
-    def add_module_bucket(module_fqns: list[str], reshard_after_forward: bool) -> int:
+    def add_module_bucket(
+        module_fqns: list[str], reshard_after_forward: bool, *, mixed: bool = False
+    ) -> int:
         for fqn in module_fqns:
             bucketed_params.update(model.get_submodule(fqn).parameters())
-        return add_bucket(module_fqns, reshard_after_forward)
+        return add_bucket(module_fqns, reshard_after_forward, mixed=mixed)
 
     # Bucket indices, for the explicit prefetch under expert parallelism.
     embedding_bucket = head_bucket = None
@@ -238,9 +263,10 @@ def apply_flex_shard_to_decoder(
                 )
             )
         shard_dims.update((param, p.dim) for param, p in placements.items())
+        mixed = not fp8_weights.isdisjoint(transformer_block.parameters())
         if moe is None or expert_mesh is None:
             block_buckets.append(
-                [add_module_bucket([block_fqn], reshard_after_forward)]
+                [add_module_bucket([block_fqn], reshard_after_forward, mixed=mixed)]
             )
             continue
         # Parameter-name buckets hook the deepest module holding their params:
@@ -252,7 +278,7 @@ def apply_flex_shard_to_decoder(
             fqns = expert_fqns if param in experts else dense_fqns
             fqns.append(param_fqns[param])
         bucketed_params.update(transformer_block.parameters())
-        dense_bucket = add_bucket(dense_fqns, reshard_after_forward)
+        dense_bucket = add_bucket(dense_fqns, reshard_after_forward, mixed=mixed)
         expert_bucket = add_bucket(expert_fqns, reshard_after_forward, mesh=expert_mesh)
         block_buckets.append([dense_bucket, expert_bucket])
         expert_buckets.append(expert_bucket)
@@ -265,6 +291,8 @@ def apply_flex_shard_to_decoder(
         add_bucket(root_fqns, reshard_after_forward=False)
 
     flex_shard(model, buckets=buckets)
+    if blockwise_fp8 or blockwise_fp8_dense_reference:
+        flex_shard_blockwise_fp8.set_global_layouts(model)
     if ep_degree > 1:
         _set_explicit_prefetch(
             # One bucket storage per BucketSpec, all of which name parameters.
@@ -530,7 +558,11 @@ def _as_fsdp2_dtensor(tensor: torch.Tensor, param: torch.Tensor) -> torch.Tensor
         return tensor
     global_shape = flex_shard.get_global_shape(param)
     mesh = flex_shard.get_mesh(param)
-    placements = tuple(Shard(p.dim) for p in flex_shard.get_placements(param))
+    # A blockwise FP8 parameter's local shard is a row range, not a Shard
+    # chunk. Viewed as Shard(0), its grad still reduces its norm correctly.
+    placements = tuple(
+        Shard(getattr(p, "dim", 0)) for p in flex_shard.get_placements(param)
+    )
     if (storage_mesh := _DENSE_STORAGE_MESHES.get(mesh)) is not None:
         # Under TP, the global shape is the TP-local shape. As FSDP2 does, lay
         # the parameter out on its data-parallel mesh and tp, with Shard on tp

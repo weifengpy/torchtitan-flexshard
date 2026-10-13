@@ -80,6 +80,29 @@ class ParallelismConfig:
     pipeline parallelism, or symmetric-memory communication yet.
     """
 
+    flex_shard_blockwise_fp8: bool = False
+    """
+    With ``fsdp_backend="flex_shard"``, all-gather the linears that
+    ``torchtitan.distributed.flex_shard_blockwise_fp8`` names as 128x128-block
+    FP8 and run them as FP8 GEMMs. They share their block's bucket with its
+    other parameters, so the number of all-gathers is unchanged.
+    """
+
+    flex_shard_blockwise_fp8_dense_reference: bool = False
+    """
+    A/B reference for ``flex_shard_blockwise_fp8``: the same linears, buckets,
+    sharding and FP8 GEMMs, but the weights all-gather their bf16 shards and are
+    quantized after the all-gather. Training should be bitwise identical. Not
+    for landing.
+    """
+
+    flex_shard_blockwise_fp8_use_triton: bool = False
+    """
+    Run the blockwise FP8 GEMMs with TorchAO's Triton kernels instead of cuBLAS
+    through ``torch.nn.functional.scaled_mm``. Quantization uses Triton either
+    way.
+    """
+
     tensor_parallel_degree: int = 1
     """Tensor Parallelism degree. 1 means disabled."""
 
@@ -248,6 +271,20 @@ class ParallelismConfig:
             raise ValueError(
                 f"parallelism.fsdp_backend must be one of {list(_FSDP_BACKENDS)} "
                 f"(got {self.fsdp_backend!r})"
+            )
+        for name in (
+            "flex_shard_blockwise_fp8",
+            "flex_shard_blockwise_fp8_dense_reference",
+        ):
+            if getattr(self, name) and self.fsdp_backend != "flex_shard":
+                raise ValueError(
+                    f"parallelism.{name} requires parallelism.fsdp_backend="
+                    f"'flex_shard' (got {self.fsdp_backend!r})"
+                )
+        if self.flex_shard_blockwise_fp8 and self.flex_shard_blockwise_fp8_dense_reference:
+            raise ValueError(
+                "Set at most one of parallelism.flex_shard_blockwise_fp8 and "
+                "parallelism.flex_shard_blockwise_fp8_dense_reference."
             )
         if self.fsdp_backend == "flex_shard":
             unsupported = [
