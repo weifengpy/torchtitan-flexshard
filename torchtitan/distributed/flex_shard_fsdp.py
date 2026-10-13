@@ -28,7 +28,7 @@ import torch.nn as nn
 from torch._prims_common import make_contiguous_strides_for
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import FSDPModule
-from torch.distributed.tensor import DTensor, Replicate, Shard
+from torch.distributed.tensor import distribute_tensor, DTensor, Replicate, Shard
 from torch.distributed.tensor.placement_types import _StridedShard
 
 from torchtitan.components.checkpointer.utils import canonical_fqn
@@ -448,10 +448,19 @@ def as_fsdp2_state_dict(
 
     The DTensors view the state dict's tensors, so in-place updates such as
     ``dcp.load`` reach them. Other entries are unchanged.
+
+    A blockwise FP8 parameter's local shard is a range of its matrix's rows,
+    packed across its bucket's parameters, which no DTensor placement describes.
+    It is given instead as a new DTensor in FSDP2's layout, Shard on the matrix
+    rows, filled from every rank's rows: a copy, not a view, whose loaded values
+    ``as_flex_shard_state_dict`` maps back to the local rows.
     """
     converted = dict(state_dict)
-    for key, param in _flex_shard_params(model_parts, state_dict):
-        converted[key] = _as_fsdp2_dtensor(state_dict[key], param)
+    for key, param, row_layout in _flex_shard_params(model_parts, state_dict):
+        if row_layout is None:
+            converted[key] = _as_fsdp2_dtensor(state_dict[key], param)
+        else:
+            converted[key] = _rows_as_fsdp2_dtensor(state_dict[key], param, row_layout)
     return converted
 
 
@@ -462,9 +471,16 @@ def as_flex_shard_state_dict(
     parameters' local shards, inverting ``as_fsdp2_state_dict`` for
     ``load_state_dict``."""
     converted = dict(state_dict)
-    for key, param in _flex_shard_params(model_parts, state_dict):
+    for key, param, row_layout in _flex_shard_params(model_parts, state_dict):
         value = state_dict[key]
         assert isinstance(value, DTensor), f"expected a DTensor for {key}"
+        if row_layout is not None:
+            full = value.full_tensor()
+            local = full.new_empty(param.shape)
+            for global_box, local_box in _layout_boxes(row_layout):
+                local[local_box] = full[global_box]
+            converted[key] = local
+            continue
         view = cast(DTensor, _as_fsdp2_dtensor(param.detach(), param))
         value = value.redistribute(view.device_mesh, view.placements)
         converted[key] = value.to_local()
@@ -473,17 +489,87 @@ def as_flex_shard_state_dict(
 
 def _flex_shard_params(
     model_parts: Iterable[nn.Module], state_dict: dict[str, Any]
-) -> Iterator[tuple[str, nn.Parameter]]:
+) -> Iterator[tuple[str, nn.Parameter, Any]]:
     """Yield the FlexShard parameters of ``model_parts`` with their keys in
-    ``state_dict``."""
+    ``state_dict`` and, for blockwise FP8 parameters, the ``GlobalLayout`` of
+    their local rows (``None`` for the others)."""
     flex_shard = sys.modules.get("flex_shard")
     if flex_shard is None:
         return
     for model in model_parts:
+        row_layouts: dict[str, Any] | None = None
         for fqn, param in model.named_parameters():
             key = canonical_fqn(fqn)
-            if key in state_dict and flex_shard.is_flex_shard_param(param):
-                yield key, param
+            if key not in state_dict or not flex_shard.is_flex_shard_param(param):
+                continue
+            row_layout = None
+            if _has_row_range_shard(param):
+                if row_layouts is None:
+                    row_layouts = {
+                        canonical_fqn(name): layout
+                        for name, layout in flex_shard.get_flex_shard_global_layouts(
+                            model
+                        ).items()
+                    }
+                row_layout = row_layouts[key]
+            yield key, param, row_layout
+
+
+def _has_row_range_shard(param: torch.Tensor) -> bool:
+    """Whether ``param``'s local shard is blockwise FP8 matrix rows."""
+    # pyrefly: ignore [missing-import]
+    from flex_shard.custom_placements import Fp8BucketedBlockShard
+
+    placements = sys.modules["flex_shard"].get_placements(param)
+    return any(isinstance(p, Fp8BucketedBlockShard) for p in placements)
+
+
+def _layout_boxes(layout: Any) -> Iterator[tuple[tuple[slice, ...], tuple[slice, ...]]]:
+    """Yield (full-parameter region, local-shard region) slices of ``layout``."""
+    for global_offset, local_offset, size in zip(
+        layout.global_offsets, layout.local_offsets, layout.local_sizes, strict=True
+    ):
+        yield (
+            tuple(slice(o, o + n) for o, n in zip(global_offset, size, strict=True)),
+            tuple(slice(o, o + n) for o, n in zip(local_offset, size, strict=True)),
+        )
+
+
+def _rows_as_fsdp2_dtensor(
+    tensor: torch.Tensor, param: torch.Tensor, layout: Any
+) -> DTensor:
+    """A blockwise FP8 parameter laid out as FSDP2 lays out linear weights: Shard
+    on the matrix rows, so a stacked [N, F, D] weight keeps N whole.
+
+    Every rank holds a disjoint set of the full parameter's elements, so summing
+    zero-filled full copies over the mesh assembles it exactly.
+    """
+    flex_shard = sys.modules["flex_shard"]
+    mesh = flex_shard.get_mesh(param)
+    if (
+        mesh.ndim != 1
+        or mesh in _DENSE_STORAGE_MESHES
+        or mesh in _EXPERT_STORAGE_MESHES
+    ):
+        raise NotImplementedError(
+            "FSDP2 state dicts of blockwise FP8 parameters need a 1D mesh without "
+            "tensor or expert parallelism storage meshes."
+        )
+    full = tensor.new_zeros(layout.global_shape)
+    for global_box, local_box in _layout_boxes(layout):
+        full[global_box] = tensor[local_box]
+    dist.all_reduce(full, group=mesh.get_group())
+    sharded = distribute_tensor(full, mesh, [Shard(full.ndim - 2)], src_data_rank=None)
+    # Copy the local rows out of ``full``, so that a view doesn't keep the whole
+    # parameter alive on every rank until the load ends.
+    return DTensor.from_local(
+        sharded.to_local().clone(),
+        mesh,
+        sharded.placements,
+        run_check=False,
+        shape=sharded.shape,
+        stride=sharded.stride(),
+    )
 
 
 class _FSDPModuleOrFlexShardMeta(type):
