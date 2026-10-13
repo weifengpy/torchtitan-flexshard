@@ -53,21 +53,11 @@ from flex_shard.custom_placements.fp8_bucketed_block_shard import (
 # pyrefly: ignore [missing-import]
 from flex_shard.custom_placements.mixed_bucket import MixedBucketPlacement
 
+from torchtitan.distributed.blockwise_fp8_targets import (
+    BLOCKWISE_FP8_LINEAR_MODULE_PATTERNS,
+)
 from torchtitan.protocols.module import Module
 
-# DeepSeek V3's attention and dense feed-forward linears, and its shared experts.
-# ``w13`` stacks the gate and up projections as one ``[2, F, D]`` weight.
-BLOCKWISE_FP8_LINEAR_MODULE_PATTERNS: tuple[str, ...] = (
-    "layers.*.attention.wq_a",
-    "layers.*.attention.wq_b",
-    "layers.*.attention.wkv_a",
-    "layers.*.attention.wkv_b",
-    "layers.*.attention.wo",
-    "layers.*.feed_forward.w13",
-    "layers.*.feed_forward.w2",
-    "layers.*.moe.shared_experts.w13",
-    "layers.*.moe.shared_experts.w2",
-)
 _FP8_DTYPE = torch.float8_e4m3fn
 
 
