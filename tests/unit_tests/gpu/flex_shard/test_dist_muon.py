@@ -6,6 +6,7 @@
 
 # @lint-ignore-every CITRINE
 
+import math
 import unittest
 from unittest import mock
 
@@ -535,6 +536,172 @@ class TestDistMuonInitialExpertStorageContract(DTensorTestBase):
         )
         compute_ready_layout = compute_ready_optimizer._parameter_compute_layouts[0]
         self.assertTrue(compute_ready_layout.storage_is_compute_ready)
+
+
+_WQ_B = "layers.0.attention.wq_b.weight"
+_WO = "layers.0.attention.wo.weight"
+_W13 = "layers.0.feed_forward.w13.weight"
+_EXPERTS = "layers.0.moe.routed_experts.w13"
+_NEXT_WO = "layers.1.attention.wo.weight"
+# Three heads of [nope; rope] rows, a matrix, gate and up, one expert per rank,
+# and the next block's matrix.
+_SHAPES = {
+    _WQ_B: (18, 5),
+    _WO: (6, 9),
+    _W13: (2, 7, 5),
+    _EXPERTS: (4, 6, 5),
+    _NEXT_WO: (9, 6),
+}
+_HEAD_BLOCKS = (4, 2)
+
+
+@unittest.skipUnless(torch.cuda.device_count() >= 4, "requires four CUDA devices")
+class TestDistMuonOwners(DTensorTestBase):
+    """Owned blocks and fixed owners, on two blocks with the routed experts'
+    local bucket between them."""
+
+    @property
+    def world_size(self):
+        return 4
+
+    @property
+    def device_type(self):
+        return "cuda"
+
+    def _values(self) -> dict[str, torch.Tensor]:
+        device = torch.device(self.device_type, self.rank)
+        return {
+            fqn: torch.arange(math.prod(shape), device=device)
+            .reshape(shape)
+            .float()
+            .mul_(0.37 + index)
+            .sin_()
+            for index, (fqn, shape) in enumerate(_SHAPES.items())
+        }
+
+    def _optimizer(
+        self,
+        params: dict[str, torch.nn.Parameter],
+        *,
+        owner_by_fqn: dict[str, int],
+        wq_b_sharding: Owned | BlockShard = Owned(block_sizes=_HEAD_BLOCKS),
+    ) -> DistMuon:
+        def layout(sharding) -> ComputeLayout:
+            return ComputeLayout(shardings_by_mesh_axis={"dp_shard": sharding})
+
+        return DistMuon(
+            [{"params": list(params.values()), "param_names": list(params)}],
+            compute_sharding_by_fqn={
+                _WQ_B: layout(wq_b_sharding),
+                _WO: layout(Owned()),
+                _W13: layout(Owned()),
+                _EXPERTS: layout(Shard(0)),
+                _NEXT_WO: layout(Owned()),
+            },
+            bucket_configs=[
+                BucketConfig(
+                    patterns=("layers.0.attention.*", "layers.0.feed_forward.*"),
+                    name="layers.0",
+                ),
+                BucketConfig(patterns=("layers.0.moe.*",), name="layers.0.experts"),
+                BucketConfig(patterns=("layers.1.*",), name="layers.1"),
+            ],
+            lr=0.03,
+            weight_decay=0.2,
+            momentum=0.8,
+            nesterov=True,
+            ns_steps=2,
+            owner_by_fqn=owner_by_fqn,
+        )
+
+    def _train(
+        self, optimizer: DistMuon, params: dict[str, torch.nn.Parameter]
+    ) -> dict[str, torch.Tensor]:
+        mesh = next(iter(params.values())).device_mesh
+        for step in range(3):
+            for index, (fqn, param) in enumerate(params.items()):
+                grad = self._values()[fqn].mul(step + 1.3).add_(index).cos_()
+                param.grad = distribute_tensor(grad, mesh, (Shard(0),))
+            optimizer.step()
+        return {fqn: param.full_tensor() for fqn, param in params.items()}
+
+    def _params(self, mesh) -> dict[str, torch.nn.Parameter]:
+        return {
+            fqn: torch.nn.Parameter(distribute_tensor(value, mesh, (Shard(0),)))
+            for fqn, value in self._values().items()
+        }
+
+    @with_comms
+    def test_owned_blocks_on_fixed_owners(self):
+        mesh = init_device_mesh(
+            self.device_type, (self.world_size,), mesh_dim_names=("dp_shard",)
+        )
+        params = self._params(mesh)
+        optimizer = self._optimizer(params, owner_by_fqn={_WQ_B: 3, _WO: 1})
+        layouts = {
+            layout.fqn: layout for layout in optimizer._parameter_compute_layouts
+        }
+        self.assertEqual(layouts[_WQ_B].compute_sharding, Owned(_HEAD_BLOCKS))
+        self.assertEqual(layouts[_WQ_B].lr_reference_shape, (6, 5))
+        computed = []
+
+        def record(compute_layout, compute):
+            computed.append((compute_layout.fqn, tuple(compute.shape)))
+            return DistMuon._compute_update(optimizer, compute_layout, compute)
+
+        with mock.patch.object(optimizer, "_compute_update", side_effect=record):
+            actual = self._train(optimizer, params)
+        # The owners compute whole parameters; the owner of wq_b per head:
+        # a batch of 3 nope blocks and a batch of 3 rope blocks.
+        self.assertEqual((_WQ_B, (18, 5)) in computed, self.rank == 3)
+        self.assertEqual((_WO, (6, 9)) in computed, self.rank == 1)
+        if self.rank == 3:
+            self.assertEqual(
+                [view.shape for view in optimizer._matrix_views_by_fqn[_WQ_B]],
+                [torch.Size((3, 4, 5)), torch.Size((3, 2, 5))],
+            )
+        computed_by_rank = [None] * self.world_size
+        torch.distributed.all_gather_object(computed_by_rank, computed)
+        for fqn in (_W13, _NEXT_WO):
+            owners = [
+                rank
+                for rank, calls in enumerate(computed_by_rank)
+                if any(name == fqn for name, _shape in calls)
+            ]
+            self.assertEqual(len(owners), 1)
+
+        # Per-head Newton-Schulz on the owner: the same update as BlockShard's
+        # heads on the data-parallel ranks, within BF16 kernel differences.
+        reference_params = self._params(mesh)
+        reference = self._train(
+            self._optimizer(
+                reference_params,
+                owner_by_fqn={_WO: 1},
+                wq_b_sharding=BlockShard(dim=0, block_sizes=_HEAD_BLOCKS),
+            ),
+            reference_params,
+        )
+        for fqn, expected in reference.items():
+            torch.testing.assert_close(actual[fqn], expected, rtol=0, atol=2e-3)
+
+    @with_comms
+    def test_rejects_invalid_fixed_owners(self):
+        mesh = init_device_mesh(
+            self.device_type, (self.world_size,), mesh_dim_names=("dp_shard",)
+        )
+        with self.assertRaisesRegex(ValueError, "mesh axis has 4 ranks"):
+            self._optimizer(self._params(mesh), owner_by_fqn={_WO: 4})
+        with self.assertRaisesRegex(ValueError, "not Owned"):
+            self._optimizer(
+                self._params(mesh),
+                owner_by_fqn={_EXPERTS: 0},
+            )
+        with self.assertRaisesRegex(ValueError, "whole repetitions"):
+            self._optimizer(
+                self._params(mesh),
+                owner_by_fqn={},
+                wq_b_sharding=Owned(block_sizes=(4, 3)),
+            )
 
 
 instantiate_parametrized_tests(TestDistMuon)

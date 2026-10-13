@@ -8,8 +8,8 @@
 
 from __future__ import annotations
 
-import heapq
 import math
+import os
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
@@ -124,6 +124,7 @@ def _initialize_dist_muon(
     compute_layouts = optimizer._build_parameter_compute_layouts(
         compute_sharding_by_fqn
     )
+    _validate_fixed_owners(compute_layouts, optimizer._owner_by_fqn)
     optimizer._specs = _bind_bucket_configs(
         tuple(bucket_configs),
         compute_layouts,
@@ -179,7 +180,22 @@ class DistMuon(Optimizer):
         eps: float = 1e-7,
         ns_steps: int = 5,
         adjust_lr_fn: str | None = None,
+        ranks_per_host: int | None = None,
+        owner_by_fqn: Mapping[str, int] | None = None,
     ) -> None:
+        if ranks_per_host is not None and ranks_per_host <= 0:
+            raise ValueError(f"ranks_per_host must be positive, got {ranks_per_host}")
+        # Owner placement balances whole matrices over hosts first (see
+        # _balance_loads_across_partitions). torchrun's LOCAL_WORLD_SIZE is the
+        # number of ranks per host; without it, every rank counts as its own host.
+        self._ranks_per_host = (
+            ranks_per_host
+            if ranks_per_host is not None
+            else int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
+        )
+        # Fixed owners of Owned parameters, as ranks on their redistribution
+        # mesh axis; the balancer places the other Owned parameters around them.
+        self._owner_by_fqn = dict(owner_by_fqn or {})
         defaults = {
             "lr": lr,
             "weight_decay": weight_decay,
@@ -323,6 +339,8 @@ class DistMuon(Optimizer):
             resolve_redistribution_plans=partial(
                 _resolve_muon_redistribution_plans,
                 ns_steps_by_group=ns_steps_by_group,
+                ranks_per_host=self._ranks_per_host,
+                owner_by_fqn=self._owner_by_fqn,
             ),
         )
 
@@ -337,7 +355,11 @@ class DistMuon(Optimizer):
                 else torch.Size(compute_partition.tensor_shape)
             )
             compute_sharding = layout.compute_sharding
-            if type(compute_sharding) is BlockShard:
+            # Ranks other than an Owned parameter's owner compute nothing.
+            if type(compute_sharding) is Owned and not compute_shape.numel():
+                return ()
+            block_sizes = _matrix_block_sizes(compute_sharding)
+            if block_sizes is not None:
                 if compute_partition is None:
                     region = _dtensor_storage_region_for_participant(
                         param, param.device_mesh.get_rank()
@@ -347,7 +369,7 @@ class DistMuon(Optimizer):
                 assert region.shape == tuple(compute_shape) and region.offsets[1] == 0
                 return _matrix_batch_views_from_shape(
                     compute_shape,
-                    matrix_row_sizes=compute_sharding.block_sizes,
+                    matrix_row_sizes=block_sizes,
                     logical_row_start=region.offsets[0],
                 )
             if not compute_shape.numel():
@@ -851,8 +873,9 @@ class _ParameterComputeLayout:
     @property
     def lr_reference_shape(self) -> tuple[int, ...]:
         """Return the same LR reference shape on every rank."""
-        if type(self.compute_sharding) is BlockShard:
-            return (sum(self.compute_sharding.block_sizes), self.param.shape[-1])
+        block_sizes = _matrix_block_sizes(self.compute_sharding)
+        if block_sizes is not None:
+            return (sum(block_sizes), self.param.shape[-1])
         return self.param.shape[-2:]
 
     @property
@@ -906,10 +929,46 @@ class _ResolvedStorageToComputeTransition:
     redistribution_storage_mesh_axis: int | None = None
 
 
+def _matrix_block_sizes(
+    compute_sharding: _ResolvedComputeSharding,
+) -> tuple[int, ...] | None:
+    """The row sizes of the independent matrices a compute sharding cuts a
+    row-concatenated parameter into, or None if it computes whole tensors."""
+    if type(compute_sharding) is BlockShard:
+        return compute_sharding.block_sizes
+    if type(compute_sharding) is Owned:
+        return compute_sharding.block_sizes
+    return None
+
+
+def _validate_fixed_owners(
+    compute_layouts: Sequence[_ParameterComputeLayout],
+    owner_by_fqn: Mapping[str, int],
+) -> None:
+    """Fixed owners name Owned parameters; entries for parameters on other
+    pipeline stages are ignored."""
+    for layout in compute_layouts:
+        owner = owner_by_fqn.get(layout.fqn)
+        if owner is None:
+            continue
+        if type(layout.compute_sharding) is not Owned:
+            raise ValueError(
+                f"owner_by_fqn names Muon parameter {layout.fqn!r}, whose compute "
+                f"layout resolves to {layout.compute_sharding!r}, not Owned"
+            )
+        if isinstance(owner, bool) or not isinstance(owner, int) or owner < 0:
+            raise ValueError(
+                f"owner_by_fqn gives Muon parameter {layout.fqn!r} owner "
+                f"{owner!r}; owners are ranks on its redistribution mesh axis"
+            )
+
+
 def _resolve_muon_redistribution_plans(
     contexts: tuple[_BucketPlanningContext[_ParameterComputeLayout], ...],
     *,
     ns_steps_by_group: Sequence[int],
+    ranks_per_host: int,
+    owner_by_fqn: Mapping[str, int],
 ) -> tuple[tuple[_RedistributionPlan | None, ...], ...]:
     """Resolve Muon compute shardings directly into transport plans."""
     cumulative_loads_by_participants: dict[tuple[int, ...], tuple[int, ...]] = {}
@@ -923,9 +982,11 @@ def _resolve_muon_redistribution_plans(
         )
         owner_ranks, cumulative_loads = _assign_balanced_owner_ranks(
             context.items,
-            participants=participants,
+            group=context.group,
             cumulative_loads=initial_loads,
             ns_steps_by_group=ns_steps_by_group,
+            ranks_per_host=ranks_per_host,
+            owner_by_fqn=owner_by_fqn,
         )
         cumulative_loads_by_participants[participants] = cumulative_loads
         bucket_specs = []
@@ -960,11 +1021,21 @@ def _resolve_muon_redistribution_plans(
 def _assign_balanced_owner_ranks(
     compute_layouts: Sequence[_ParameterComputeLayout],
     *,
-    participants: tuple[int, ...],
+    group: _RedistributionGroup,
     cumulative_loads: Sequence[int],
     ns_steps_by_group: Sequence[int],
+    ranks_per_host: int,
+    owner_by_fqn: Mapping[str, int],
 ) -> tuple[tuple[int | None, ...], tuple[int, ...]]:
-    """Balance temporary compute ownership within and across ordered buckets."""
+    """Balance temporary compute ownership within and across ordered buckets.
+
+    Matrices go to hosts first, then to ranks within them, so heavy and light
+    hosts alternate in rank order (see ``_balance_loads_across_partitions``).
+    Parameters in ``owner_by_fqn`` keep their owners, and the others balance
+    around them. Moving a whole matrix to another owner doesn't change its
+    update.
+    """
+    participants = group.participants
     assignments: list[int | None] = [None] * len(compute_layouts)
     candidates = tuple(
         (index, layout)
@@ -974,9 +1045,8 @@ def _assign_balanced_owner_ranks(
     candidate_partitions, updated_cumulative_loads = _balance_loads_across_partitions(
         tuple(
             (
-                _estimate_muon_compute_cost(
-                    layout.param.shape,
-                    ns_steps_by_group[layout.group_index],
+                _estimate_layout_compute_cost(
+                    layout, ns_steps_by_group[layout.group_index]
                 ),
                 layout.param.numel() * layout.param.element_size(),
                 layout.fqn,
@@ -984,6 +1054,11 @@ def _assign_balanced_owner_ranks(
             for _index, layout in candidates
         ),
         initial_cumulative_primary_loads=cumulative_loads,
+        partition_hosts=_participant_hosts(participants, ranks_per_host),
+        fixed_partitions=tuple(
+            _fixed_owner_partition(layout, group, owner_by_fqn)
+            for _index, layout in candidates
+        ),
     )
     for (index, _layout), partition in zip(
         candidates,
@@ -992,6 +1067,41 @@ def _assign_balanced_owner_ranks(
     ):
         assignments[index] = participants[partition]
     return tuple(assignments), updated_cumulative_loads
+
+
+def _fixed_owner_partition(
+    layout: _ParameterComputeLayout,
+    group: _RedistributionGroup,
+    owner_by_fqn: Mapping[str, int],
+) -> int | None:
+    """A fixed owner's index in ``group.participants``. Owners count ranks in
+    mesh order, which the process group's rank order need not follow."""
+    owner = owner_by_fqn.get(layout.fqn)
+    if owner is None or layout.storage_is_compute_ready:
+        return None
+    mesh_axis_participants = group.mesh_axis_participants
+    if owner >= len(mesh_axis_participants):
+        raise ValueError(
+            f"owner_by_fqn gives Muon parameter {layout.fqn!r} owner {owner}, but "
+            f"its redistribution mesh axis has {len(mesh_axis_participants)} ranks"
+        )
+    return group.participants.index(mesh_axis_participants[owner])
+
+
+def _estimate_layout_compute_cost(
+    layout: _ParameterComputeLayout,
+    ns_steps: int,
+) -> int:
+    """Newton-Schulz cost of a parameter's matrices: per block for Owned
+    blocks, which cost far less than the whole matrix."""
+    block_sizes = _matrix_block_sizes(layout.compute_sharding)
+    if block_sizes is None:
+        return _estimate_muon_compute_cost(layout.param.shape, ns_steps)
+    rows, columns = layout.param.shape
+    return (rows // sum(block_sizes)) * sum(
+        _estimate_muon_compute_cost(torch.Size((block_rows, columns)), ns_steps)
+        for block_rows in block_sizes
+    )
 
 
 def _estimate_muon_compute_cost(
@@ -1005,55 +1115,118 @@ def _estimate_muon_compute_cost(
     return num_matrices * ns_steps * short_dim * short_dim * (2 * long_dim + short_dim)
 
 
+def _participant_hosts(
+    participants: Sequence[int], ranks_per_host: int
+) -> tuple[int, ...]:
+    """Each participant's host, numbered 0, 1, ... in participant order, with
+    hosts of ``ranks_per_host`` consecutive global ranks, as torchrun numbers
+    them."""
+    host_ids: dict[int, int] = {}
+    return tuple(
+        host_ids.setdefault(rank // ranks_per_host, len(host_ids))
+        for rank in participants
+    )
+
+
+def _even_first_positions(count: int) -> list[int]:
+    """Each of 0, ..., count - 1's position in the order 0, 2, 4, ..., 1, 3, ..."""
+    return [
+        index // 2 if index % 2 == 0 else (count + 1) // 2 + index // 2
+        for index in range(count)
+    ]
+
+
 def _balance_loads_across_partitions(
     loads: Sequence[tuple[int, int, str]],
     *,
     initial_cumulative_primary_loads: Sequence[int],
+    partition_hosts: Sequence[int],
+    fixed_partitions: Sequence[int | None] | None = None,
 ) -> tuple[tuple[int, ...], tuple[int, ...]]:
-    """Balance keyed loads with a deterministic LPT heuristic.
+    """Balance keyed loads with a deterministic LPT heuristic, hosts first.
 
     Each load is ``(primary, secondary, stable_key)``. Assignments are
-    partition indices aligned with those loads. Each call balances its primary
-    and then secondary loads before cumulative primary load. Stable keys make
-    ordering deterministic. This is not an exact partition optimum.
+    partition indices aligned with those loads. Each load, largest first, goes
+    to the host with the least primary and then secondary load in this call,
+    then the least cumulative primary load, and then to that host's partition
+    by the same keys. Remaining ties take hosts, and partitions within a host,
+    in the order 0, 2, 4, ..., 1, 3, ..., so heavy and light hosts alternate in
+    partition order; with FlexShard's owner rows cut into equal chunks in that
+    order, a heavy host's overflow lands in a light neighbor's chunks.
+    ``partition_hosts`` gives each partition's host, numbered 0, 1, ... Stable
+    keys make ordering deterministic. This is not an exact partition optimum.
+    Loads with a partition in ``fixed_partitions`` take it first, and the
+    others balance around them.
     """
     num_partitions = len(initial_cumulative_primary_loads)
-    assignments = [0] * len(loads)
-    partition_loads = [
-        (0, 0, cumulative_load, partition)
-        for partition, cumulative_load in enumerate(initial_cumulative_primary_loads)
+    num_hosts = len(set(partition_hosts))
+    members: list[list[int]] = [[] for _ in range(num_hosts)]
+    for partition, host in enumerate(partition_hosts):
+        members[host].append(partition)
+    host_position = _even_first_positions(num_hosts)
+    partition_position = [0] * num_partitions
+    for partitions in members:
+        for partition, position in zip(
+            partitions, _even_first_positions(len(partitions)), strict=True
+        ):
+            partition_position[partition] = position
+    cumulative = list(initial_cumulative_primary_loads)
+    primary_loads = [0] * num_partitions
+    secondary_loads = [0] * num_partitions
+    host_primary = [0] * num_hosts
+    host_secondary = [0] * num_hosts
+    host_cumulative = [
+        sum(cumulative[partition] for partition in partitions) for partitions in members
     ]
-    heapq.heapify(partition_loads)
+    assignments = [0] * len(loads)
+
+    def assign(load_index: int, partition: int) -> None:
+        primary, secondary, _stable_key = loads[load_index]
+        host = partition_hosts[partition]
+        assignments[load_index] = partition
+        primary_loads[partition] += primary
+        secondary_loads[partition] += secondary
+        cumulative[partition] += primary
+        host_primary[host] += primary
+        host_secondary[host] += secondary
+        host_cumulative[host] += primary
+
+    free_loads = []
+    for load_index, load in enumerate(loads):
+        fixed = None if fixed_partitions is None else fixed_partitions[load_index]
+        if fixed is None:
+            free_loads.append((load_index, load))
+        else:
+            assign(load_index, fixed)
     ordered_loads = sorted(
-        enumerate(loads),
+        free_loads,
         key=lambda indexed_load: (
             -indexed_load[1][0],
             -indexed_load[1][1],
             indexed_load[1][2],
         ),
     )
-    for load_index, (primary, secondary, _stable_key) in ordered_loads:
-        (
-            current_primary,
-            current_secondary,
-            cumulative_primary,
-            partition,
-        ) = heapq.heappop(partition_loads)
-        assignments[load_index] = partition
-        heapq.heappush(
-            partition_loads,
-            (
-                current_primary + primary,
-                current_secondary + secondary,
-                cumulative_primary + primary,
-                partition,
+    for load_index, _load in ordered_loads:
+        host = min(
+            range(num_hosts),
+            key=lambda host: (
+                host_primary[host],
+                host_secondary[host],
+                host_cumulative[host],
+                host_position[host],
             ),
         )
-
-    updated_cumulative_primary_loads = [0] * num_partitions
-    for _primary, _secondary, cumulative_primary, partition in partition_loads:
-        updated_cumulative_primary_loads[partition] = cumulative_primary
-    return tuple(assignments), tuple(updated_cumulative_primary_loads)
+        partition = min(
+            members[host],
+            key=lambda partition: (
+                primary_loads[partition],
+                secondary_loads[partition],
+                cumulative[partition],
+                partition_position[partition],
+            ),
+        )
+        assign(load_index, partition)
+    return tuple(assignments), tuple(cumulative)
 
 
 def _build_parameter_redistribution_plan(
@@ -1425,6 +1598,27 @@ def _resolve_storage_to_compute_transition(
         )
         if type(sharding) is Owned
     )
+    owned_shardings = {
+        cast(Owned, applicable_compute_shardings_by_storage_mesh_axis[axis])
+        for axis in applicable_owned_storage_mesh_axes
+    }
+    if len(owned_shardings) > 1:
+        raise ValueError(
+            f"Muon parameter {fqn!r} must use the same Owned block sizes across "
+            "mesh axes"
+        )
+    owned = next(iter(owned_shardings), None)
+    if owned is not None and owned.block_sizes is not None:
+        if param.ndim != 2:
+            raise ValueError(
+                f"Muon parameter {fqn!r} Owned blocks currently require a 2D "
+                f"row-concatenated parameter; got shape {tuple(param.shape)}"
+            )
+        if param.shape[0] % sum(owned.block_sizes):
+            raise ValueError(
+                f"Muon parameter {fqn!r} has {param.shape[0]} rows, which aren't "
+                f"whole repetitions of its Owned block sizes {owned.block_sizes}"
+            )
 
     # Unit mesh axes normalize to Replicate but retain their declared blocks.
     block_shards = tuple(
@@ -1656,9 +1850,10 @@ def _resolve_storage_to_compute_transition(
     owned_axis_set = set(applicable_owned_storage_mesh_axes)
     for storage_mesh_axis, axis_name in enumerate(mesh_axis_names):
         if storage_mesh_axis in owned_axis_set:
+            assert owned is not None
             target_sharding: (
                 Owned | _AxisComputeSharding | _UnsupportedStoragePlacement
-            ) = Owned()
+            ) = owned
         elif storage_mesh_axis in normalized_target_sharding_by_storage_mesh_axis:
             target_sharding = normalized_target_sharding_by_storage_mesh_axis[
                 storage_mesh_axis
@@ -1691,7 +1886,8 @@ def _resolve_storage_to_compute_transition(
             "matrix or matrix-batch tensor"
         )
     if active_owned_storage_mesh_axes:
-        compute_sharding: _ResolvedComputeSharding = Owned()
+        assert owned is not None
+        compute_sharding: _ResolvedComputeSharding = owned
     elif compute_shard_dims:
         if block_shard is None and param.ndim == 2:
             raise ValueError(
@@ -1707,8 +1903,8 @@ def _resolve_storage_to_compute_transition(
                 "matrix batch sharded only on tensor dimension 0"
             )
         compute_sharding = block_shard if block_shard is not None else Shard(0)
-    elif applicable_owned_storage_mesh_axes:
-        compute_sharding = Owned()
+    elif owned is not None:
+        compute_sharding = owned
     else:
         raise ValueError(f"unsupported storage-to-compute layout for {fqn!r}")
 
