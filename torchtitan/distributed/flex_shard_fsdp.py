@@ -119,7 +119,8 @@ def apply_flex_shard_to_decoder(
             go in a bucket of their own, to be stored whole on owner ranks
             after initialization (``parallelism.flex_shard_owned_params``,
             ``relayout_owned_buckets``). Until then the bucket shards like the
-            others, so initialization matches FSDP2's.
+            others, so initialization matches FSDP2's. Patterns covering the
+            whole block outside the routed experts leave the block one bucket.
     """
     # flex_shard is an optional dependency, needed only for this backend.
     # pyrefly: ignore [missing-import]
@@ -280,7 +281,11 @@ def apply_flex_shard_to_decoder(
             else:
                 dense_fqns.append(param_fqns[param])
         bucketed_params.update(transformer_block.parameters())
-        buckets_of_block = [add_bucket(dense_fqns, reshard_after_forward)]
+        # When the owned patterns cover the whole block, its owned bucket is its
+        # only bucket outside the routed experts: one collective per block.
+        buckets_of_block = []
+        if dense_fqns:
+            buckets_of_block.append(add_bucket(dense_fqns, reshard_after_forward))
         if owned_fqns:
             buckets_of_block.append(add_bucket(owned_fqns, reshard_after_forward))
         if expert_fqns:
