@@ -8,6 +8,7 @@ import unittest
 
 import torch
 
+from torchtitan.distributed.flex_shard import Owned
 from torchtitan.distributed.flex_shard.dist_muon import (
     _balance_loads_across_partitions,
     _estimate_muon_compute_cost,
@@ -83,6 +84,34 @@ class TestDistMuonOwnerPlacement(unittest.TestCase):
         # Every matrix still has one owner, and owners never share a matrix.
         self.assertEqual(set(owners), set(one_host))
         self.assertEqual(len(set(owners.values())), len(owners))
+
+    def test_fixed_owners_keep_their_ranks(self):
+        # Two hosts of two ranks. Alone, the largest load takes rank 0 and the
+        # others follow; fixed on rank 3, it stays there, the others balance
+        # around it, and the carried loads count it.
+        loads = [(100, 1, "a"), (60, 1, "b"), (50, 1, "c"), (40, 1, "d")]
+        hosts = (0, 0, 1, 1)
+        balanced, _ = _balance_loads_across_partitions(
+            loads,
+            initial_cumulative_primary_loads=(0, 0, 0, 0),
+            partition_hosts=hosts,
+        )
+        self.assertEqual(balanced, (0, 2, 3, 1))
+        partitions, cumulative = _balance_loads_across_partitions(
+            loads,
+            initial_cumulative_primary_loads=(0, 0, 0, 0),
+            partition_hosts=hosts,
+            fixed_partitions=(3, None, None, None),
+        )
+        self.assertEqual(partitions, (3, 0, 1, 2))
+        self.assertEqual(cumulative, (60, 50, 40, 100))
+
+    def test_owned_block_sizes_are_validated(self):
+        self.assertIsNone(Owned().block_sizes)
+        self.assertEqual(Owned(block_sizes=(128, 64)).block_sizes, (128, 64))
+        for block_sizes in ((), (4, 0), [4], (True,)):
+            with self.assertRaisesRegex(ValueError, "Owned.block_sizes"):
+                Owned(block_sizes=block_sizes)
 
 
 if __name__ == "__main__":
