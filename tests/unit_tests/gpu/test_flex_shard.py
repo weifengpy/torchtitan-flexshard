@@ -41,6 +41,7 @@ from torchtitan.distributed.cuda_graph import (
 from torchtitan.distributed.flex_shard_fsdp import (
     as_flex_shard_state_dict,
     as_fsdp2_state_dict,
+    relayout_owned_buckets,
 )
 from torchtitan.distributed.fsdp import get_fsdp_group, set_requires_gradient_sync
 from torchtitan.distributed.parallelism_context import ParallelismContext
@@ -87,6 +88,7 @@ class TestFlexShardDecoder(DTensorTestBase):
         reshard_after_forward: str,
         parallelism_context: ParallelismContext,
         build_config=build_model_config,
+        owned_params: tuple[str, ...] = (),
         **parallelism_options,
     ):
         parallelism = ParallelismConfig(
@@ -97,6 +99,7 @@ class TestFlexShardDecoder(DTensorTestBase):
             expert_parallel_degree=parallelism_context.ep,
             fsdp_backend=fsdp_backend,
             fsdp_reshard_after_forward=reshard_after_forward,
+            flex_shard_owned_params=list(owned_params),
             **parallelism_options,
         )
         model_config = build_config("debugmodel", seq_len=_seq_len(parallelism_context))
@@ -128,6 +131,9 @@ class TestFlexShardDecoder(DTensorTestBase):
             model.to_empty(device=self.device_type)
             with torch.no_grad():
                 model.init_weights(buffer_device=None)
+            if owned_params:
+                # As the trainer does after initialization.
+                relayout_owned_buckets(model, owned_params)
         return model, model_config, parallelism, parallelism_context
 
     def _train(
@@ -144,6 +150,7 @@ class TestFlexShardDecoder(DTensorTestBase):
         spmd_typechecking=False,
         defer_gradient_reduction=True,
         cuda_graphs=False,
+        max_norm=1.0,
     ):
         if optim is None:
             optim = torch.optim.AdamW(model.parameters(), lr=1e-3, foreach=True)
@@ -252,7 +259,7 @@ class TestFlexShardDecoder(DTensorTestBase):
             losses = list(forward_backward(prepared_microbatches).clone())
             grad_norm = dist_utils.clip_grad_norm_(
                 list(model.parameters()),
-                max_norm=1.0,
+                max_norm=max_norm,
                 foreach=True,
                 ep_enabled=parallelism_context.ep_enabled,
             )
@@ -394,6 +401,135 @@ class TestFlexShardDecoder(DTensorTestBase):
             [("default", 1)],
             build_deepseek_v3_model_config,
             spmd_typechecking=True,
+        )
+
+    @with_comms
+    def test_dist_muon_without_optimizer_communication(self):
+        # DistMuon as the DeepSeek V3 recipe sets it up, with whole experts on
+        # each rank (ep 4). FlexShard stores every block parameter outside the
+        # routed experts whole on owners (MLA_DIST_MUON_OWNED_PARAMS), one bucket
+        # per block, and runs DistMuon on each rank's local storage: its losses
+        # equal FSDP2's bit for bit over 3 steps, with clipping off (grad norms
+        # may round apart, as owners split the sum of squares differently), and
+        # its DistMuon step runs no collectives, while FSDP2's redistributes.
+        # FSDP2's DistMuon takes FlexShard's layout (flex_shard_layout): each of
+        # those matrices computes on the rank FlexShard stores it on.
+        from torchtitan.components.checkpointer.utils import canonical_fqn
+        from torchtitan.distributed.flex_shard._optimizer_reshard_schedule import (
+            _RedistributionBucketPlan,
+        )
+        from torchtitan_recipes.tests.models.dist_muon import (
+            mla_dist_muon_optimizer,
+            MLA_DIST_MUON_OWNED_PARAMS,
+        )
+
+        parallelism_context = ParallelismContext(
+            dp_replicate=1,
+            dp_shard=self.world_size,
+            cp=1,
+            tp=1,
+            pp=1,
+            ep=self.world_size,
+            world_size=self.world_size,
+            enable_sequence_parallel=False,
+        )
+        losses, collectives = {}, {}
+        owners: dict[str, dict[str, int]] = {"fsdp2": {}, "flex_shard": {}}
+        for backend, owned in (
+            ("fsdp2", ()),
+            ("flex_shard", MLA_DIST_MUON_OWNED_PARAMS),
+        ):
+            model, *setup = self._build(
+                backend,
+                "default",
+                parallelism_context,
+                build_deepseek_v3_model_config,
+                owned_params=owned,
+            )
+            model_config, parallelism, _ = setup
+            if backend == "flex_shard":
+                # pyrefly: ignore [missing-import]
+                from flex_shard.custom_placements.owned import BucketedOwned
+
+                buckets_per_block: dict[str, int] = {}
+                for storage in model.sharded_bucket_storages:
+                    fqns = [
+                        fqn
+                        for fqn in storage.param_infos
+                        if fqn.startswith("layers.") and ".routed_experts." not in fqn
+                    ]
+                    if not fqns:
+                        continue
+                    block = ".".join(fqns[0].split(".")[:2])
+                    buckets_per_block[block] = buckets_per_block.get(block, 0) + 1
+                    for fqn in fqns:
+                        placement = storage.param_infos[fqn].placement
+                        self.assertIsInstance(placement, BucketedOwned, fqn)
+                        (segment,) = placement.segments_by_fqn[fqn]
+                        owners[backend][canonical_fqn(fqn)] = segment.owner_rank
+                self.assertEqual(
+                    set(buckets_per_block.values()), {1}, buckets_per_block
+                )
+            optim = mla_dist_muon_optimizer(
+                model_config,
+                muon_lr=8e-4,
+                adamw_lr=8e-4,
+                parallelism=parallelism,
+                flex_shard_layout=True,
+            ).build(model_parts=[model])
+            (dist_muon,) = [
+                o for o in optim.optimizers if "DistMuon" in type(o).__name__
+            ]
+            if backend == "fsdp2":
+                for bucket in dist_muon._bucket_plans:
+                    if not isinstance(bucket, _RedistributionBucketPlan):
+                        continue
+                    ranks = bucket.group.mesh_axis_participants
+                    for item, plan in zip(
+                        bucket.redistributed_items,
+                        bucket.redistribution_plans,
+                        strict=True,
+                    ):
+                        (owner,) = [
+                            partition.participant
+                            for partition in plan.compute_partitions
+                            if partition.logical_regions
+                        ]
+                        owners[backend][item.fqn] = ranks.index(owner)
+                muon_fqns = {
+                    fqn
+                    for fqn in dist_muon.param_groups[0]["param_names"]
+                    if ".routed_experts." not in fqn
+                }
+                self.assertEqual(set(owners[backend]), muon_fqns)
+            collectives[backend] = []
+            step = dist_muon.step
+
+            def profiled_step(*args, _step=step, _calls=collectives[backend]):
+                with torch.profiler.profile(
+                    activities=[torch.profiler.ProfilerActivity.CPU]
+                ) as prof:
+                    out = _step(*args)
+                _calls.append(
+                    sum(event.name.startswith("c10d::") for event in prof.events())
+                )
+                return out
+
+            dist_muon.step = profiled_step
+            history = self._train(model, *setup, 1, False, optim=optim, max_norm=1e9)
+            losses[backend] = [losses_of_step for losses_of_step, *_ in history]
+        for step, (expected, actual) in enumerate(
+            zip(losses["fsdp2"], losses["flex_shard"], strict=True)
+        ):
+            for expected_loss, actual_loss in zip(expected, actual, strict=True):
+                self.assertTrue(
+                    torch.equal(expected_loss, actual_loss), msg=f"step {step} loss"
+                )
+        self.assertEqual(collectives["flex_shard"], [0, 0, 0])
+        self.assertTrue(all(collectives["fsdp2"]), collectives["fsdp2"])
+        self.assertEqual(
+            owners["fsdp2"],
+            {fqn: owners["flex_shard"][fqn] for fqn in owners["fsdp2"]},
         )
 
     @with_comms
