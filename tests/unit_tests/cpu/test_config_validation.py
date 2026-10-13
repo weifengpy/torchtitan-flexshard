@@ -191,6 +191,22 @@ def test_flex_shard_checkpointing() -> None:
             TrainingEngine.Config.__post_init__(config)
 
 
+def test_flex_shard_owned_params_reject_blockwise_fp8() -> None:
+    # Owner buckets have no blockwise FP8 member.
+    ParallelismConfig(fsdp_backend="flex_shard", flex_shard_owned_params=["wo"])
+    for option in (
+        "flex_shard_blockwise_fp8",
+        "flex_shard_blockwise_fp8_dense_reference",
+    ):
+        ParallelismConfig(fsdp_backend="flex_shard", **{option: True})
+        with pytest.raises(ValueError, match="owner buckets have no blockwise FP8"):
+            ParallelismConfig(
+                fsdp_backend="flex_shard",
+                flex_shard_owned_params=["wo"],
+                **{option: True},
+            )
+
+
 def test_spmd_typechecking_rejects_pipeline_parallelism() -> None:
     with pytest.raises(ValueError, match="SPMD typechecking"):
         TrainingEngine.Config(

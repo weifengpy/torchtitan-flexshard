@@ -6,7 +6,7 @@
 
 """Parallelism configuration."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import get_args, Literal, TypeAlias
 
 import torch
@@ -80,12 +80,23 @@ class ParallelismConfig:
     pipeline parallelism, or symmetric-memory communication yet.
     """
 
+    flex_shard_owned_params: list[str] = field(default_factory=list)
+    """
+    With ``fsdp_backend="flex_shard"``, regex patterns of parameter FQNs that
+    FlexShard stores whole on one owner rank (``BucketedOwned``), in their own
+    bucket per transformer block. They initialize and load like the other
+    parameters, then move to their owners once. For optimizers that update
+    whole matrices on one rank, e.g. DistMuon's ``Owned`` compute layouts, whose
+    step then runs without communication.
+    """
+
     flex_shard_blockwise_fp8: bool = False
     """
     With ``fsdp_backend="flex_shard"``, all-gather the linears that
     ``torchtitan.distributed.flex_shard_blockwise_fp8`` names as 128x128-block
     FP8 and run them as FP8 GEMMs. They share their block's bucket with its
-    other parameters, so the number of all-gathers is unchanged.
+    other parameters, so the number of all-gathers is unchanged. Not with
+    ``flex_shard_owned_params``: owner buckets have no blockwise FP8 member.
     """
 
     flex_shard_blockwise_fp8_dense_reference: bool = False
@@ -272,6 +283,11 @@ class ParallelismConfig:
                 f"parallelism.fsdp_backend must be one of {list(_FSDP_BACKENDS)} "
                 f"(got {self.fsdp_backend!r})"
             )
+        if self.flex_shard_owned_params and self.fsdp_backend != "flex_shard":
+            raise ValueError(
+                "parallelism.flex_shard_owned_params needs "
+                "parallelism.fsdp_backend='flex_shard'."
+            )
         for name in (
             "flex_shard_blockwise_fp8",
             "flex_shard_blockwise_fp8_dense_reference",
@@ -285,6 +301,14 @@ class ParallelismConfig:
             raise ValueError(
                 "Set at most one of parallelism.flex_shard_blockwise_fp8 and "
                 "parallelism.flex_shard_blockwise_fp8_dense_reference."
+            )
+        if self.flex_shard_owned_params and (
+            self.flex_shard_blockwise_fp8 or self.flex_shard_blockwise_fp8_dense_reference
+        ):
+            raise ValueError(
+                "parallelism.flex_shard_owned_params doesn't support "
+                "parallelism.flex_shard_blockwise_fp8 or its dense reference: "
+                "owner buckets have no blockwise FP8 member."
             )
         if self.fsdp_backend == "flex_shard":
             unsupported = [

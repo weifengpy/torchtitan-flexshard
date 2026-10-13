@@ -262,6 +262,7 @@ class MTPDecoder(Decoder):
                     (f"mtp_layers.{name}", layer)
                     for name, layer in self.mtp_layers.named_children()
                 ],
+                owned_param_patterns=parallelism.flex_shard_owned_params,
                 blockwise_fp8=parallelism.flex_shard_blockwise_fp8,
                 blockwise_fp8_dense_reference=(
                     parallelism.flex_shard_blockwise_fp8_dense_reference
