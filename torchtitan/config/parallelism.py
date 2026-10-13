@@ -103,6 +103,16 @@ class ParallelismConfig:
     way.
     """
 
+    fsdp2_blockwise_fp8: bool = False
+    """
+    With ``fsdp_backend="fsdp2"``, run the linears that
+    ``torchtitan.distributed.blockwise_fp8_targets`` names as 128x128-block FP8
+    GEMMs on FSDP2's bf16 all-gather, quantizing the weight on every call as
+    TorchAO's ``Float8BlockwiseLinear`` does: the FSDP2 baseline for
+    ``flex_shard_blockwise_fp8``. Uses cuBLAS ``scaled_mm``, as the FlexShard
+    options do by default.
+    """
+
     tensor_parallel_degree: int = 1
     """Tensor Parallelism degree. 1 means disabled."""
 
@@ -285,6 +295,11 @@ class ParallelismConfig:
             raise ValueError(
                 "Set at most one of parallelism.flex_shard_blockwise_fp8 and "
                 "parallelism.flex_shard_blockwise_fp8_dense_reference."
+            )
+        if self.fsdp2_blockwise_fp8 and self.fsdp_backend != "fsdp2":
+            raise ValueError(
+                "parallelism.fsdp2_blockwise_fp8 requires parallelism.fsdp_backend="
+                f"'fsdp2' (got {self.fsdp_backend!r})"
             )
         if self.fsdp_backend == "flex_shard":
             unsupported = [
