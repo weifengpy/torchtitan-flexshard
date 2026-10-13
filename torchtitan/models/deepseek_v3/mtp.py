@@ -262,6 +262,7 @@ class MTPDecoder(Decoder):
                     (f"mtp_layers.{name}", layer)
                     for name, layer in self.mtp_layers.named_children()
                 ],
+                owned_param_patterns=parallelism.flex_shard_owned_params,
             )
             return
         apply_fsdp_to_mtp_decoder(

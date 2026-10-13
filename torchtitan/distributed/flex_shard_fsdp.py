@@ -17,8 +17,9 @@ mesh, and the block gets one bucket per group. FlexShard is imported only when
 
 import contextlib
 import logging
+import re
 import sys
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from typing import Any, cast, TYPE_CHECKING
 
 import spmd_types as spmd
@@ -50,8 +51,11 @@ __all__ = [
     "as_fsdp2_dtensor",
     "as_fsdp2_state_dict",
     "enable_pipelining",
+    "flex_shard_owner_map",
     "fsdp2_dtensor_params",
     "grads_for_norm",
+    "owned_placement_fn",
+    "relayout_owned_buckets",
 ]
 
 logger = logging.getLogger(__name__)
@@ -75,6 +79,7 @@ def apply_flex_shard_to_decoder(
     ep_degree: int = 1,
     edp_mesh: DeviceMesh | None = None,
     extra_blocks: Sequence[tuple[str, nn.Module]] = (),
+    owned_param_patterns: Sequence[str] = (),
 ) -> None:
     """Shard a decoder with FlexShard as ``apply_fsdp_to_decoder`` does with FSDP2.
 
@@ -113,6 +118,12 @@ def apply_flex_shard_to_decoder(
         extra_blocks: Transformer blocks outside ``model.layers``, by FQN, each
             sharded like a block after the last one, e.g. DeepSeek V3's MTP
             layers, which ``apply_fsdp_to_mtp_decoder`` appends to the layers.
+        owned_param_patterns: Regex patterns of a block's parameter FQNs that
+            go in a bucket of their own, to be stored whole on owner ranks
+            after initialization (``parallelism.flex_shard_owned_params``,
+            ``relayout_owned_buckets``). Until then the bucket shards like the
+            others, so initialization matches FSDP2's. Patterns covering the
+            whole block outside the routed experts leave the block one bucket.
     """
     # flex_shard is an optional dependency, needed only for this backend.
     # pyrefly: ignore [missing-import]
@@ -217,6 +228,12 @@ def apply_flex_shard_to_decoder(
                 ["norm", "lm_head"], reshard_after_forward_policy == "always"
             )
     param_fqns = {param: fqn for fqn, param in model.named_parameters()}
+    owned_res = [re.compile(pattern) for pattern in owned_param_patterns]
+
+    def is_owned(param: nn.Parameter) -> bool:
+        fqn = canonical_fqn(param_fqns[param])
+        return any(pattern.search(fqn) for pattern in owned_res)
+
     blocks = [
         (f"layers.{layer_id}", transformer_block)
         for layer_id, transformer_block in model.layers.items()
@@ -238,24 +255,49 @@ def apply_flex_shard_to_decoder(
                 )
             )
         shard_dims.update((param, p.dim) for param, p in placements.items())
-        if moe is None or expert_mesh is None:
+        owned = {param for param in transformer_block.parameters() if is_owned(param)}
+        if not owned and (moe is None or expert_mesh is None):
             block_buckets.append(
                 [add_module_bucket([block_fqn], reshard_after_forward)]
             )
             continue
         # Parameter-name buckets hook the deepest module holding their params:
-        # the block for the dense bucket, the routed experts for the other.
-        # Name them as flex_shard does, with any activation-checkpoint wrapper.
-        experts = set(moe.routed_experts.parameters())
-        dense_fqns, expert_fqns = [], []
+        # the block for the dense and owned buckets, the routed experts for the
+        # expert bucket. Name them as flex_shard does, with any
+        # activation-checkpoint wrapper.
+        experts = (
+            set(moe.routed_experts.parameters())
+            if moe is not None and expert_mesh is not None
+            else set()
+        )
+        if experts & owned:
+            raise ValueError(
+                "parallelism.flex_shard_owned_params can't name routed experts, "
+                "which FlexShard shards over the expert mesh."
+            )
+        dense_fqns, owned_fqns, expert_fqns = [], [], []
         for param in transformer_block.parameters():
-            fqns = expert_fqns if param in experts else dense_fqns
-            fqns.append(param_fqns[param])
+            if param in experts:
+                expert_fqns.append(param_fqns[param])
+            elif param in owned:
+                owned_fqns.append(param_fqns[param])
+            else:
+                dense_fqns.append(param_fqns[param])
         bucketed_params.update(transformer_block.parameters())
-        dense_bucket = add_bucket(dense_fqns, reshard_after_forward)
-        expert_bucket = add_bucket(expert_fqns, reshard_after_forward, mesh=expert_mesh)
-        block_buckets.append([dense_bucket, expert_bucket])
-        expert_buckets.append(expert_bucket)
+        # When the owned patterns cover the whole block, its owned bucket is its
+        # only bucket outside the routed experts: one collective per block.
+        buckets_of_block = []
+        if dense_fqns:
+            buckets_of_block.append(add_bucket(dense_fqns, reshard_after_forward))
+        if owned_fqns:
+            buckets_of_block.append(add_bucket(owned_fqns, reshard_after_forward))
+        if expert_fqns:
+            expert_bucket = add_bucket(
+                expert_fqns, reshard_after_forward, mesh=expert_mesh
+            )
+            buckets_of_block.append(expert_bucket)
+            expert_buckets.append(expert_bucket)
+        block_buckets.append(buckets_of_block)
     # fully_shard(model) puts the remaining parameters in the root group, which
     # FSDP2 does not reshard after forward.
     root_fqns = [
@@ -264,6 +306,14 @@ def apply_flex_shard_to_decoder(
     if root_fqns:
         add_bucket(root_fqns, reshard_after_forward=False)
 
+    if owned_res:
+        # Owner storage serves optimizers that compute on local storage, such as
+        # DistMuon through build_local_dist_muon, which reads each parameter's
+        # checkpoint coordinates from before flex_shard().
+        # pyrefly: ignore [missing-import]
+        from flex_shard.dist_muon import capture_flex_shard_muon_canonical_shards
+
+        capture_flex_shard_muon_canonical_shards(model)
     flex_shard(model, buckets=buckets)
     if ep_degree > 1:
         _set_explicit_prefetch(
@@ -513,13 +563,134 @@ def grads_for_norm(parameters: Iterable[torch.Tensor]) -> list[torch.Tensor]:
     """Return the parameters' grads, with FlexShard's local shards as DTensors.
 
     Viewed as the DTensors FSDP2 would produce, FlexShard grads reduce their
-    norm over their meshes as FSDP2's grads do.
+    norm over their meshes as FSDP2's grads do. A grad stored whole on its
+    owner (``parallelism.flex_shard_owned_params``), and empty on the other
+    ranks, has no DTensor placement; as a ``Shard(0)`` DTensor on its bucket's
+    mesh, a norm still sums each rank's local elements and reduces over the
+    mesh, so each element counts once. These views serve norms only.
     """
     return [
-        _as_fsdp2_dtensor(param.grad, param)
+        _owner_grad_for_norm(param)
+        if _is_owner_stored(param)
+        else _as_fsdp2_dtensor(param.grad, param)
         for param in parameters
         if param.grad is not None
     ]
+
+
+def _is_owner_stored(param: torch.Tensor) -> bool:
+    flex_shard = sys.modules.get("flex_shard")
+    if flex_shard is None or not flex_shard.is_flex_shard_param(param):
+        return False
+    # pyrefly: ignore [missing-import]
+    from flex_shard.custom_placements.owned import BucketedOwned
+
+    return isinstance(flex_shard.get_placements(param)[0], BucketedOwned)
+
+
+def _owner_grad_for_norm(param: torch.Tensor) -> torch.Tensor:
+    flex_shard = sys.modules["flex_shard"]
+    global_shape = flex_shard.get_global_shape(param)
+    return DTensor.from_local(
+        param.grad,
+        flex_shard.get_mesh(param),
+        (Shard(0),),
+        run_check=False,
+        shape=global_shape,
+        stride=make_contiguous_strides_for(global_shape),
+    )
+
+
+def owned_placement_fn() -> Callable:
+    """The placement of owned buckets: each parameter whole on one rank of
+    its bucket's mesh, owners balanced over hosts first, then over ranks
+    within a host, carrying each rank's load from bucket to bucket. Share one
+    across a rank's model parts, so virtual stages balance together too."""
+    # pyrefly: ignore [missing-import]
+    from flex_shard.custom_placements.owned import (
+        make_bucketed_owned_full_param_placement_fn,
+    )
+
+    return make_bucketed_owned_full_param_placement_fn(carry_loads=True)
+
+
+def flex_shard_owner_map(
+    model_parts: Sequence[nn.Module],
+    owned_param_patterns: Sequence[str],
+) -> dict[str, int]:
+    """The owner FlexShard gives each parameter ``owned_param_patterns`` names,
+    by canonical FQN, as its rank on the data-parallel mesh: each block's owned
+    parameters one bucket, as ``apply_flex_shard_to_decoder`` builds them
+    (decoder layers, then MTP layers), placed in model-part order by one
+    ``owned_placement_fn``, as ``relayout_owned_buckets`` places them.
+
+    The placement depends only on the parameters' global sizes, their order,
+    and the mesh's ranks and hosts, so another backend's model parts with the
+    same blocks, e.g. FSDP2's on the same data-parallel mesh, get the owners a
+    FlexShard run of the same job has."""
+    patterns = [re.compile(pattern) for pattern in owned_param_patterns]
+    placement_fn = owned_placement_fn()
+    owners: dict[str, int] = {}
+    for model in model_parts:
+        fqns = {param: canonical_fqn(name) for name, param in model.named_parameters()}
+        layers = getattr(model, "layers", None)
+        mtp_layers = getattr(model, "mtp_layers", None)
+        blocks = [
+            *(layers.values() if layers is not None else ()),
+            *(mtp_layers.children() if mtp_layers is not None else ()),
+        ]
+        for block in blocks:
+            named_params = [
+                (fqns[param], param)
+                for param in block.parameters()
+                if any(pattern.search(fqns[param]) for pattern in patterns)
+            ]
+            if not named_params:
+                continue
+            meshes = {
+                param.device_mesh
+                for _fqn, param in named_params
+                if isinstance(param, DTensor)
+            }
+            if len(meshes) != 1 or next(iter(meshes)).ndim != 1:
+                raise ValueError(
+                    "flex_shard_owner_map needs each block's owned parameters "
+                    "on one one-dimensional data-parallel mesh, as DTensors"
+                )
+            # Full parameters, as FlexShard places them: DTensor sizes are global.
+            for fqn, (placement,) in placement_fn(
+                named_params, next(iter(meshes))
+            ).items():
+                (segment,) = placement.segments_by_fqn[fqn]
+                owners[fqn] = segment.owner_rank
+    return owners
+
+
+def relayout_owned_buckets(
+    model: nn.Module,
+    owned_param_patterns: Sequence[str],
+    placement_fn: Callable | None = None,
+) -> None:
+    """Move the buckets ``apply_flex_shard_to_decoder`` made for
+    ``owned_param_patterns`` to whole-parameter owners (``owned_placement_fn``,
+    or ``placement_fn``), once, after initialization or loading. Values move
+    bitwise."""
+    # pyrefly: ignore [missing-import]
+    from flex_shard import relayout_bucket
+
+    patterns = [re.compile(pattern) for pattern in owned_param_patterns]
+    if placement_fn is None:
+        placement_fn = owned_placement_fn()
+    # pyrefly: ignore [missing-attribute]
+    for storage in list(model.sharded_bucket_storages):
+        owned = [
+            any(pattern.search(canonical_fqn(fqn)) for pattern in patterns)
+            for fqn in storage.param_infos
+        ]
+        if not any(owned):
+            continue
+        assert all(owned), list(storage.param_infos)
+        relayout_bucket(model, storage, placement_fn)
 
 
 def _as_fsdp2_dtensor(tensor: torch.Tensor, param: torch.Tensor) -> torch.Tensor:
