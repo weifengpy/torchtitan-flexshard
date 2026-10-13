@@ -174,6 +174,10 @@ class Decoder(BaseModel):
                 ep_degree=parallelism_context.ep,
                 edp_mesh=edp_mesh,
                 owned_param_patterns=parallelism.flex_shard_owned_params,
+                blockwise_fp8=parallelism.flex_shard_blockwise_fp8,
+                blockwise_fp8_dense_reference=(
+                    parallelism.flex_shard_blockwise_fp8_dense_reference
+                ),
             )
             return
         apply_fsdp_to_decoder(
