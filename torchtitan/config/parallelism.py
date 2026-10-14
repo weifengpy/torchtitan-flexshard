@@ -124,6 +124,18 @@ class ParallelismConfig:
     options do by default.
     """
 
+    fsdp2_blockwise_fp8_quantize_per_gather: bool = False
+    """
+    With ``fsdp2_blockwise_fp8``: quantize each all-gathered weight once, in
+    FSDP2's post-all-gather hook, and free the bf16 all-gather buffers right
+    after, instead of quantizing the bf16 weight on every call. The forward, the
+    recomputed forward and the input gradient of one all-gather share its FP8
+    weight (128x128 blocks have the same scales in either layout), and the
+    linears run FlexShard's FP8 linear, as ``flex_shard_blockwise_fp8`` does.
+    The strongest FSDP2 baseline where FSDP2's even split cuts 128-row blocks.
+    Needs every FP8 linear's dims to be whole 128-blocks.
+    """
+
     tensor_parallel_degree: int = 1
     """Tensor Parallelism degree. 1 means disabled."""
 
