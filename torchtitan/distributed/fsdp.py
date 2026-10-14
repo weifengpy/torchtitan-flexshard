@@ -377,6 +377,7 @@ def apply_fsdp_to_decoder(
     symm_mem_scope: FSDPSymmMemScope = None,
     *,
     param_dtype_override_fn: Callable[[nn.Parameter], torch.dtype | None] | None = None,
+    separate_reduce_scatter_group: bool = False,
 ):
     """
     Apply data parallelism (via FSDP2) to a decoder-style transformer model.
@@ -419,6 +420,9 @@ def apply_fsdp_to_decoder(
         symm_mem_scope: Which FSDP modules use symmetric-memory communication.
         param_dtype_override_fn: Optional callback that overrides ``param_dtype``
             for selected parameters.
+        separate_reduce_scatter_group: Whether gradient reduce-scatters run on a
+            process group of their own
+            (``FSDPModule.set_separate_reduce_scatter_group``).
     """
     mp_policy = MixedPrecisionPolicy(
         param_dtype=param_dtype,
@@ -567,6 +571,9 @@ def apply_fsdp_to_decoder(
             )
 
     fully_shard(model, **fsdp_config)
+
+    if separate_reduce_scatter_group:
+        model.set_separate_reduce_scatter_group()
 
     enable_fsdp_symm_mem(model, symm_mem_scope)
 

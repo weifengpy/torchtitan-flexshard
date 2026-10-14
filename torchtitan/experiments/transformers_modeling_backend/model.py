@@ -231,6 +231,9 @@ class HFTransformerModel(BaseModel):
             cpu_offload=training.enable_cpu_offload,
             reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
             symm_mem_scope=parallelism.fsdp_symm_mem_scope,
+            separate_reduce_scatter_group=(
+                parallelism.fsdp_separate_reduce_scatter_group
+            ),
             ep_degree=parallelism_context.ep,
             dp_mod_ep_mesh=edp_mesh,
             dp_mesh_dims=dp_mesh_dims,

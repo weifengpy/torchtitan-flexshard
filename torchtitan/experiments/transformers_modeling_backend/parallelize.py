@@ -209,6 +209,7 @@ def apply_fsdp(
     edp_mesh_dims: DataParallelMeshDims | None = None,
     gradient_divide_factor: int | None = None,
     symm_mem_scope: FSDPSymmMemScope = None,
+    separate_reduce_scatter_group: bool = False,
 ):
     """Apply data parallelism (via FSDP2) to the model.
 
@@ -334,6 +335,9 @@ def apply_fsdp(
         )
 
     fully_shard(model, **fsdp_config)
+
+    if separate_reduce_scatter_group:
+        model.set_separate_reduce_scatter_group()
 
     enable_fsdp_symm_mem(model, symm_mem_scope)
 
