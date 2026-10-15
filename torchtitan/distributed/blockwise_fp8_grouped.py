@@ -13,6 +13,8 @@ backend, and a BF16 weight gradient. Under FlexShard the experts' weights
 all-gather as FP8 blocks (``flex_shard_blockwise_fp8``), which the GEMM takes as
 gathered; under FSDP2 they all-gather in bf16 and the GEMM quantizes them on
 every call. Both quantize the same blocks, so both compute the same bytes.
+The routed experts' token dispatcher pads each expert's token group to a whole
+128-row block, so the GEMM needs no padding of its own, whatever the routing.
 flex_shard is imported only with this option.
 """
 
@@ -23,18 +25,28 @@ import torch_remat as remat
 from torch import nn
 
 from torchtitan.models.common.linear import GroupedLinear
+from torchtitan.models.common.moe import RoutedExperts
+from torchtitan.models.common.token_dispatcher import (
+    AllToAllTokenDispatcher,
+    TorchAOTokenDispatcher,
+)
 
 BLOCKWISE_FP8_GROUPED_LINEAR_MODULE_PATTERNS: tuple[str, ...] = (
     "layers.*.moe.routed_experts.w13",
     "layers.*.moe.routed_experts.w2",
 )
 
+# The FP8 grouped GEMM's block rows, to which the token dispatcher pads each
+# expert's token group.
+_TOKEN_GROUP_ALIGNMENT = 128
+
 
 class BlockwiseFp8GroupedLinear(GroupedLinear):
     """A ``GroupedLinear`` whose grouped GEMM is blockwise FP8.
 
-    ``groups_aligned``: every group's row count is a multiple of 128, as with
-    forced balanced routing, so the GEMM skips padding and host syncs.
+    ``groups_aligned``: every group's row count is a multiple of 128, as the
+    padding token dispatcher makes them, so the GEMM skips padding of its own
+    and reading the group sizes on the host.
     """
 
     groups_aligned: bool = False
@@ -114,12 +126,12 @@ class BlockwiseFp8GroupedLinear(GroupedLinear):
             )
 
 
-def convert_blockwise_fp8_grouped_linears(
-    model: nn.Module, *, groups_aligned: bool
-) -> None:
+def convert_blockwise_fp8_grouped_linears(model: nn.Module) -> None:
     """Turn the grouped linears ``BLOCKWISE_FP8_GROUPED_LINEAR_MODULE_PATTERNS``
     names into ``BlockwiseFp8GroupedLinear``, keeping their parameters and
-    state. Call before ``Module._parallelize()``."""
+    state, and make their routed experts' token dispatcher pad each expert's
+    token group to 128 rows, so the GEMM's groups are whole blocks for any
+    routing. Call before ``Module._parallelize()``."""
     import fnmatch
 
     converted = 0
@@ -129,10 +141,36 @@ def convert_blockwise_fp8_grouped_linears(
             for pattern in BLOCKWISE_FP8_GROUPED_LINEAR_MODULE_PATTERNS
         ):
             module.__class__ = BlockwiseFp8GroupedLinear
-            module.groups_aligned = groups_aligned
+            module.groups_aligned = True
             converted += 1
     if not converted:
         raise ValueError(
             "parallelism.blockwise_fp8_routed_experts found no grouped linears "
             f"matching {BLOCKWISE_FP8_GROUPED_LINEAR_MODULE_PATTERNS}."
         )
+    for module in model.modules():
+        if isinstance(module, RoutedExperts) and isinstance(
+            module.w13, BlockwiseFp8GroupedLinear
+        ):
+            _pad_token_groups(module.token_dispatcher)
+
+
+def _pad_token_groups(dispatcher: nn.Module) -> None:
+    """Make an all-to-all token dispatcher pad each local expert's token group
+    to ``_TOKEN_GROUP_ALIGNMENT`` rows: ``TorchAOTokenDispatcher`` is the
+    all-to-all dispatcher plus that padding, done without host syncs."""
+    if isinstance(dispatcher, TorchAOTokenDispatcher):
+        if dispatcher.pad_multiple % _TOKEN_GROUP_ALIGNMENT:
+            raise ValueError(
+                "FP8 routed experts need token groups padded to a multiple of "
+                f"{_TOKEN_GROUP_ALIGNMENT} rows, but the dispatcher pads to "
+                f"{dispatcher.pad_multiple}."
+            )
+        return
+    if type(dispatcher) is not AllToAllTokenDispatcher:
+        raise ValueError(
+            "FP8 routed experts need the all-to-all token dispatcher, got "
+            f"{type(dispatcher).__name__}."
+        )
+    dispatcher.__class__ = TorchAOTokenDispatcher
+    dispatcher.pad_multiple = _TOKEN_GROUP_ALIGNMENT

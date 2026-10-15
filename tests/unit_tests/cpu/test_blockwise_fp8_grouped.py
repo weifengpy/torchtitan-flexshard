@@ -11,7 +11,12 @@ from torchtitan.distributed.blockwise_fp8_grouped import (
     BlockwiseFp8GroupedLinear,
     convert_blockwise_fp8_grouped_linears,
 )
+from torchtitan.models.common.config_utils import (
+    make_routed_experts_config,
+    split_gate_up_and_store_experts_2d,
+)
 from torchtitan.models.common.linear import GroupedLinear
+from torchtitan.models.common.token_dispatcher import TorchAOTokenDispatcher
 
 
 def _grouped_linear(num_linears: int) -> GroupedLinear:
@@ -39,7 +44,7 @@ def test_converts_routed_expert_grouped_linears_in_place():
     model = _model()
     experts = model.layers["3"].moe.routed_experts
     w13_weight = experts.w13.weight
-    convert_blockwise_fp8_grouped_linears(model, groups_aligned=True)
+    convert_blockwise_fp8_grouped_linears(model)
 
     for name in ("w13", "w2"):
         module = getattr(experts, name)
@@ -52,4 +57,23 @@ def test_converts_routed_expert_grouped_linears_in_place():
 
 def test_conversion_without_routed_experts_raises():
     with pytest.raises(ValueError, match="found no grouped linears"):
-        convert_blockwise_fp8_grouped_linears(nn.Module(), groups_aligned=False)
+        convert_blockwise_fp8_grouped_linears(nn.Module())
+
+
+def test_routed_experts_dispatcher_pads_token_groups():
+    """Their token dispatcher pads each expert's group to 128 rows, so the FP8
+    GEMM's groups are whole blocks whatever the routing."""
+    config = make_routed_experts_config(
+        dim=256, hidden_dim=128, num_experts=4, top_k=2, param_init={}
+    )
+    split_gate_up_and_store_experts_2d(config)
+    model = nn.Module()
+    model.layers = nn.ModuleDict({"3": nn.Module()})
+    model.layers["3"].moe = nn.Module()
+    model.layers["3"].moe.routed_experts = config.build()
+    convert_blockwise_fp8_grouped_linears(model)
+
+    experts = model.layers["3"].moe.routed_experts
+    assert type(experts.token_dispatcher) is TorchAOTokenDispatcher
+    assert experts.token_dispatcher.pad_multiple == 128
+    assert experts.w13.groups_aligned and experts.w2.groups_aligned

@@ -179,10 +179,7 @@ class BaseModel(Module, ABC):
                     convert_blockwise_fp8_grouped_linears,
                 )
 
-                convert_blockwise_fp8_grouped_linears(
-                    self,
-                    groups_aligned=parallelism.blockwise_fp8_expert_groups_aligned,
-                )
+                convert_blockwise_fp8_grouped_linears(self)
             self._parallelize(parallelism_context)
             if ac_config is not None:
                 ac_config.build(dump_folder=dump_folder).apply(self)

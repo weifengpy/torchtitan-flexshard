@@ -155,15 +155,10 @@ class ParallelismConfig:
     gradient with 128x128 weight blocks, and a BF16 weight gradient. FlexShard
     all-gathers the experts' weights as FP8 blocks and the GEMM takes them as
     gathered; FSDP2 all-gathers them in bf16 and the GEMM quantizes them on
-    every call. Needs the experts' dims to be whole 128-blocks, and under
+    every call. The routed experts' token dispatcher then pads each expert's
+    token group to a whole 128-row block, for any routing. Needs the experts'
+    dims to be whole 128-blocks, the all-to-all token dispatcher, and under
     FlexShard their weights stored 2-D (``GroupedLinear`` ``rows_on_dim0``).
-    """
-
-    blockwise_fp8_expert_groups_aligned: bool = False
-    """
-    With ``blockwise_fp8_routed_experts``: every expert's token group is a
-    multiple of 128 rows, as with forced balanced routing, so the FP8 grouped
-    GEMM skips padding the groups and reading their sizes on the host.
     """
 
     fsdp2_native_collective_copy: bool = False
