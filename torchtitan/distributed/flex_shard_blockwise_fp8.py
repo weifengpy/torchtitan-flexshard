@@ -54,6 +54,7 @@ from flex_shard.custom_placements.fp8_bucketed_block_shard import (
 # pyrefly: ignore [missing-import]
 from flex_shard.custom_placements.mixed_bucket import MixedBucketPlacement
 
+from torchtitan.distributed.blockwise_fp8_grouped import BlockwiseFp8GroupedLinear
 from torchtitan.distributed.blockwise_fp8_targets import (
     BLOCKWISE_FP8_LINEAR_MODULE_PATTERNS,
 )
@@ -85,7 +86,9 @@ class FlexShardBlockwiseFp8Linear(FlexShardFloat8BlockwiseLinear, Module):
         return new_mod
 
     def _init_param(self, name: str, param: nn.Parameter) -> None:
-        layout = None if self._global_layouts is None else self._global_layouts.get(name)
+        layout = (
+            None if self._global_layouts is None else self._global_layouts.get(name)
+        )
         if layout is None or self._param_init is None:
             super()._init_param(name, param)
             return
@@ -147,16 +150,21 @@ def convert_blockwise_fp8_linears(model: nn.Module, *, use_triton: bool) -> None
 
 
 def blockwise_fp8_weights(model: nn.Module) -> set[nn.Parameter]:
-    """Return the weights of the model's ``FlexShardBlockwiseFp8Linear`` modules."""
+    """Return the weights of the model's ``FlexShardBlockwiseFp8Linear`` and
+    ``BlockwiseFp8GroupedLinear`` modules."""
     return {
         module.weight
         for module in model.modules()
-        if isinstance(module, FlexShardBlockwiseFp8Linear)
+        if isinstance(module, (FlexShardBlockwiseFp8Linear, BlockwiseFp8GroupedLinear))
     }
 
 
 def make_mixed_placement_fn(
-    model: nn.Module, shard_placement_fn: PlacementFn, *, dense_reference: bool
+    model: nn.Module,
+    shard_placement_fn: PlacementFn,
+    *,
+    dense_reference: bool,
+    row_blocks: bool = False,
 ) -> PlacementFn:
     """Place a bucket's FP8 linear weights and its other parameters in one
     ``MixedBucketPlacement``.
@@ -164,21 +172,27 @@ def make_mixed_placement_fn(
     ``shard_placement_fn`` gives the other parameters' placements, which must be
     ``Shard(0)``: a mixed bucket has no member for other shard dims. With
     ``dense_reference``, the FP8 weights all-gather bf16 and are quantized
-    after the gather, with the same layout.
+    after the gather, with the same layout. ``row_blocks`` keeps the FP8
+    weights on block-row units whatever ``FLEX_SHARD_FP8_TILE_UNITS`` says, as
+    ``BlockwiseFp8GroupedLinear``'s initialization needs.
     """
     fp8_weights = blockwise_fp8_weights(model)
-    make_fp8_placement_fn = (
-        make_dense_all_gather_reference_placement_fn
-        if dense_reference
-        else make_fp8_bucketed_block_placement_fn
-    )
-    fp8_placement_fn = make_fp8_placement_fn(
-        weight_factory=BlockwiseFp8Weight, fp8_dtype=_FP8_DTYPE
-    )
+    if dense_reference:
+        fp8_placement_fn = make_dense_all_gather_reference_placement_fn(
+            weight_factory=BlockwiseFp8Weight, fp8_dtype=_FP8_DTYPE
+        )
+    else:
+        fp8_placement_fn = make_fp8_bucketed_block_placement_fn(
+            weight_factory=BlockwiseFp8Weight,
+            fp8_dtype=_FP8_DTYPE,
+            tile_units=False if row_blocks else None,
+        )
 
     def placement_fn(named_params, mesh):
         mixed_bucket = MixedBucketPlacement({})
-        fp8_params = [(fqn, param) for fqn, param in named_params if param in fp8_weights]
+        fp8_params = [
+            (fqn, param) for fqn, param in named_params if param in fp8_weights
+        ]
         shard_params = [
             (fqn, param) for fqn, param in named_params if param not in fp8_weights
         ]
@@ -199,11 +213,11 @@ def make_mixed_placement_fn(
 
 
 def set_global_layouts(model: nn.Module) -> None:
-    """Give each ``FlexShardBlockwiseFp8Linear`` its parameters' layouts, for
-    initialization. Call once ``flex_shard`` has sharded the model."""
+    """Give each ``FlexShardBlockwiseFp8Linear`` and ``BlockwiseFp8GroupedLinear``
+    its parameters' layouts, for initialization. Call once ``flex_shard`` has sharded the model."""
     layouts = get_flex_shard_global_layouts(model)
     for fqn, module in model.named_modules():
-        if isinstance(module, FlexShardBlockwiseFp8Linear):
+        if isinstance(module, (FlexShardBlockwiseFp8Linear, BlockwiseFp8GroupedLinear)):
             module._global_layouts = {
                 name: layouts[f"{fqn}.{name}"]
                 for name, _ in module.named_parameters(recurse=False)
