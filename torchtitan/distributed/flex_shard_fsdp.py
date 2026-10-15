@@ -461,10 +461,20 @@ def _set_explicit_prefetch(
     one, the first one the embedding. A block prefetches from its first bucket,
     which hooks the block, and prefetches all its buckets. Its expert bucket,
     whose group FSDP2 unshards with the block, prefetches nothing.
+
+    In backward, a block's expert bucket is gathered first, as FSDP2 orders a
+    module's groups. Gathering the dense bucket first left each dense gather
+    running beside the current block's expert reduce-scatter, on the same
+    network cards.
     """
+    experts = set(expert_buckets)
 
     def block(idx: int) -> list:
         return [storages[bucket] for bucket in block_buckets[idx]]
+
+    def block_backward(idx: int) -> list:
+        ordered = sorted(block_buckets[idx], key=lambda bucket: bucket not in experts)
+        return [storages[bucket] for bucket in ordered]
 
     for bucket in expert_buckets:
         storages[bucket].set_buckets_to_forward_prefetch([])
@@ -472,7 +482,7 @@ def _set_explicit_prefetch(
     if embedding_bucket is not None and block_buckets:
         storages[embedding_bucket].set_buckets_to_forward_prefetch(block(0))
     if head_bucket is not None and block_buckets:
-        storages[head_bucket].set_buckets_to_backward_prefetch(block(-1))
+        storages[head_bucket].set_buckets_to_backward_prefetch(block_backward(-1))
     for idx, buckets in enumerate(block_buckets):
         first = storages[buckets[0]]
         if idx + 1 < len(block_buckets):
@@ -482,7 +492,7 @@ def _set_explicit_prefetch(
         else:
             first.set_buckets_to_forward_prefetch([])
         if idx > 0:
-            first.set_buckets_to_backward_prefetch(block(idx - 1))
+            first.set_buckets_to_backward_prefetch(block_backward(idx - 1))
         elif embedding_bucket is not None:
             first.set_buckets_to_backward_prefetch([storages[embedding_bucket]])
 
