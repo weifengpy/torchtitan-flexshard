@@ -8,12 +8,15 @@
 blockwise FP8 options so both convert the same modules."""
 
 # DeepSeek V3's attention and dense feed-forward linears, and its shared experts.
-# ``w13`` stacks the gate and up projections as one ``[2, F, D]`` weight.
+# Llama 3 shares the ``attention.wo`` and ``feed_forward`` names and adds its fused
+# ``attention.qkv_linear.wqkv``. ``w13`` stacks the gate and up projections as one
+# ``[2, F, D]`` weight.
 BLOCKWISE_FP8_LINEAR_MODULE_PATTERNS: tuple[str, ...] = (
     "layers.*.attention.wq_a",
     "layers.*.attention.wq_b",
     "layers.*.attention.wkv_a",
     "layers.*.attention.wkv_b",
+    "layers.*.attention.qkv_linear.wqkv",
     "layers.*.attention.wo",
     "layers.*.feed_forward.w13",
     "layers.*.feed_forward.w2",
