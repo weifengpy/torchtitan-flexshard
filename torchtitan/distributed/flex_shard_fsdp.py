@@ -82,6 +82,7 @@ def apply_flex_shard_to_decoder(
     owned_param_patterns: Sequence[str] = (),
     blockwise_fp8: bool = False,
     blockwise_fp8_dense_reference: bool = False,
+    separate_reduce_scatter_group: bool = False,
 ) -> None:
     """Shard a decoder with FlexShard as ``apply_fsdp_to_decoder`` does with FSDP2.
 
@@ -132,6 +133,9 @@ def apply_flex_shard_to_decoder(
         blockwise_fp8_dense_reference: As ``blockwise_fp8``, but the converted
             linears all-gather bf16 and are quantized after the gather, with
             the same layout: the A/B reference for ``blockwise_fp8``.
+        separate_reduce_scatter_group: Whether gradient reduce-scatters run on a
+            process group of their own
+            (``FlexShardModule.set_separate_reduce_scatter_group``).
     """
     # flex_shard is an optional dependency, needed only for this backend.
     # pyrefly: ignore [missing-import]
@@ -343,6 +347,8 @@ def apply_flex_shard_to_decoder(
 
         capture_flex_shard_muon_canonical_shards(model)
     flex_shard(model, buckets=buckets)
+    if separate_reduce_scatter_group:
+        model.set_separate_reduce_scatter_group()
     if blockwise_fp8 or blockwise_fp8_dense_reference:
         flex_shard_blockwise_fp8.set_global_layouts(model)
     if ep_degree > 1:
