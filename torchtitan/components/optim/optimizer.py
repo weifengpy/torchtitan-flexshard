@@ -280,7 +280,7 @@ def _build_flex_shard_dist_muon(
     config: DistMuon.Config,
     model: nn.Module,
     param_group: dict[str, Any],
-) -> Optimizer:
+) -> Optimizer | None:
     """DistMuon over a FlexShard model's parameters, with no collectives in
     its step.
 
@@ -292,6 +292,11 @@ def _build_flex_shard_dist_muon(
     mesh, through FlexShard's ``build_local_dist_muon``: the same matrix views
     and batches per parameter as on the data-parallel mesh, so the same update.
     A whole matrix computed alone gives the same result on any owner.
+
+    Returns None on a rank that stores none of the group's parameters, e.g. a
+    model part of dense blocks with every block parameter owned, at more ranks
+    than it has Muon parameters: the rank has no Muon work there, and the step
+    runs no collectives that other ranks would wait on.
     """
     # pyrefly: ignore [missing-import]
     from flex_shard import get_placements
@@ -344,9 +349,7 @@ def _build_flex_shard_dist_muon(
         model, named_params, optimizer_factory=optimizer_factory
     )
     if binding is None:
-        raise ValueError(
-            "DistMuon with FlexShard found no local Muon parameters on this rank."
-        )
+        return None
     optimizer = cast(_LocalDistMuon, binding.optimizer)
     optimizer.binding = binding
     return optimizer
@@ -380,6 +383,10 @@ class OptimizersContainer(Optimizer, Stateful, Configurable):
 
     optimizers: list[Optimizer]
     model_parts: list[nn.Module]
+    # FlexShard parameters with no optimizer on this rank: a model part's Muon
+    # parameters on a rank that stores none of them (see
+    # _build_flex_shard_dist_muon). zero_grad clears their (empty) grads.
+    params_without_local_optimizer: list[nn.Parameter]
 
     @staticmethod
     def _build_param_group(
@@ -420,6 +427,7 @@ class OptimizersContainer(Optimizer, Stateful, Configurable):
         all_params: list[nn.Parameter] = []
         self.optimizers = []
         self.model_parts = model_parts
+        self.params_without_local_optimizer = []
 
         for part_idx, model in enumerate(self.model_parts):
             claimed: set[str] = set()
@@ -435,6 +443,12 @@ class OptimizersContainer(Optimizer, Stateful, Configurable):
                     optimizer = _build_flex_shard_dist_muon(
                         optimizer_config, model, param_group
                     )
+                    if optimizer is None:
+                        self.params_without_local_optimizer.extend(
+                            param_group["params"]
+                        )
+                        all_params.extend(param_group["params"])
+                        continue
                 else:
                     optimizer = optimizer_config.build(params=[param_group])
                 if enable_cuda_graph:
@@ -544,6 +558,11 @@ class OptimizersContainer(Optimizer, Stateful, Configurable):
     def zero_grad(self, set_to_none: bool = True) -> None:
         for optimizer in self.optimizers:
             optimizer.zero_grad(set_to_none=set_to_none)
+        for param in self.params_without_local_optimizer:
+            if set_to_none:
+                param.grad = None
+            elif param.grad is not None:
+                param.grad.zero_()
 
     def state_dict(self) -> dict[str, Any]:
         """Return a flat, FQN-keyed optimizer state dict for all optimizers.

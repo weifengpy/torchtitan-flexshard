@@ -27,17 +27,17 @@ from torchtitan.trainer import Trainer
 
 
 # With parallelism.fsdp_backend="flex_shard", the parameters FlexShard stores
-# whole on owners (parallelism.flex_shard_owned_params), so DistMuon's step needs
-# no communication: those mla_dist_muon_optimizer gives Owned compute layouts;
-# wkv_a, whose one block pattern ([kv_latent; k_rope]) is the whole matrix; and
-# w13, whose gate and up DistMuon computes apart, each as a batch of one, which
-# FSDP2's row shards mix. On one owner they run as one batch of two, which gives
-# the same bits (checked on H100 for the debug model's and DeepSeek V3's shapes).
-# The row shards of the other Muon parameters hold whole heads or experts.
+# whole on owners (parallelism.flex_shard_owned_params): every block parameter
+# outside the routed experts, which stay whole per expert-parallel rank. Each
+# block is then one owner bucket, gathered and reduced in one collective as FSDP2
+# does, and DistMuon's step needs no communication: each owner runs the Muon
+# units of its parameters (whole matrices, heads, wkv_a's [kv_latent; k_rope],
+# w13's gate and up as one batch of two), with the same bits as DistMuon's
+# redistribution (checked on H100: a head block, or gate and up, gives the same
+# bits in a batch of 1, 2 or 128). Norms are AdamW's.
 MLA_DIST_MUON_OWNED_PARAMS = (
-    r"\.attention\.(?:wq_a|wkv_a|wo)\.weight$",
-    r"\.moe\.router\.gate\.weight$",
-    r"\.(?:feed_forward|moe\.shared_experts)\.(?:w13|w2)\.weight$",
+    r"\.(?:attention|attention_norm|ffn_norm|feed_forward|moe\.router"
+    r"|moe\.shared_experts)\.",
 )
 
 
