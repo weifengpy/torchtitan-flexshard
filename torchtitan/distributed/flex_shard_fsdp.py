@@ -49,6 +49,7 @@ __all__ = [
     "apply_flex_shard_to_decoder",
     "as_fsdp2_dtensor",
     "enable_pipelining",
+    "flex_shard_owner_map",
     "fsdp2_dtensor_params",
     "grads_for_norm",
     "owned_placement_fn",
@@ -562,6 +563,58 @@ def owned_placement_fn() -> Callable:
     )
 
     return make_bucketed_owned_full_param_placement_fn(carry_loads=True)
+
+
+def flex_shard_owner_map(
+    model_parts: Sequence[nn.Module],
+    owned_param_patterns: Sequence[str],
+) -> dict[str, int]:
+    """The owner FlexShard gives each parameter ``owned_param_patterns`` names,
+    by canonical FQN, as its rank on the data-parallel mesh: each block's owned
+    parameters one bucket, as ``apply_flex_shard_to_decoder`` builds them
+    (decoder layers, then MTP layers), placed in model-part order by one
+    ``owned_placement_fn``, as ``relayout_owned_buckets`` places them.
+
+    The placement depends only on the parameters' global sizes, their order,
+    and the mesh's ranks and hosts, so another backend's model parts with the
+    same blocks, e.g. FSDP2's on the same data-parallel mesh, get the owners a
+    FlexShard run of the same job has."""
+    patterns = [re.compile(pattern) for pattern in owned_param_patterns]
+    placement_fn = owned_placement_fn()
+    owners: dict[str, int] = {}
+    for model in model_parts:
+        fqns = {param: canonical_fqn(name) for name, param in model.named_parameters()}
+        layers = getattr(model, "layers", None)
+        mtp_layers = getattr(model, "mtp_layers", None)
+        blocks = [
+            *(layers.values() if layers is not None else ()),
+            *(mtp_layers.children() if mtp_layers is not None else ()),
+        ]
+        for block in blocks:
+            named_params = [
+                (fqns[param], param)
+                for param in block.parameters()
+                if any(pattern.search(fqns[param]) for pattern in patterns)
+            ]
+            if not named_params:
+                continue
+            meshes = {
+                param.device_mesh
+                for _fqn, param in named_params
+                if isinstance(param, DTensor)
+            }
+            if len(meshes) != 1 or next(iter(meshes)).ndim != 1:
+                raise ValueError(
+                    "flex_shard_owner_map needs each block's owned parameters "
+                    "on one one-dimensional data-parallel mesh, as DTensors"
+                )
+            # Full parameters, as FlexShard places them: DTensor sizes are global.
+            for fqn, (placement,) in placement_fn(
+                named_params, next(iter(meshes))
+            ).items():
+                (segment,) = placement.segments_by_fqn[fqn]
+                owners[fqn] = segment.owner_rank
+    return owners
 
 
 def relayout_owned_buckets(
