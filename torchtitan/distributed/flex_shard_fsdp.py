@@ -221,6 +221,9 @@ def apply_flex_shard_to_decoder(
         *,
         mixed: bool = False,
         experts: bool = False,
+        defer_post_backward: bool = False,
+        post_reduce_hook: Callable[[list[tuple[str, nn.Parameter]]], None]
+        | None = None,
     ) -> int:
         if mixed:
             bucket_placement_fn = (
@@ -236,6 +239,8 @@ def apply_flex_shard_to_decoder(
                 mp_policy=mp_policy,
                 gradient_divide_factor=1.0,
                 reshard_after_forward=reshard_after_forward,
+                post_reduce_hook=post_reduce_hook,
+                defer_post_backward=defer_post_backward,
                 # fsdp2_compatible requires Shard placements.
                 fsdp2_compatible=not mixed,
             )
@@ -329,12 +334,30 @@ def apply_flex_shard_to_decoder(
             else:
                 dense_fqns.append(param_fqns[param])
         bucketed_params.update(transformer_block.parameters())
+        # With expert parallelism, the block's end issues its expert
+        # reduce-scatter, then its dense one, as FSDP2 does for a module's two
+        # parameter groups: the expert bucket defers its post-backward, and the
+        # dense bucket finishes it before reducing its own grads. With the
+        # experts-first backward prefetch, both NCCL streams then carry expert,
+        # then dense collectives at the same time. Hooked on the routed experts,
+        # the expert reduce-scatter would start mid-block instead, beside the
+        # next block's dense gather.
+        reduce_experts_at_block_end = bool(expert_fqns and dense_fqns and ep_degree > 1)
         # When the owned patterns cover the whole block, its owned bucket is its
         # only bucket outside the routed experts: one collective per block.
         buckets_of_block = []
         if dense_fqns:
             buckets_of_block.append(
-                add_bucket(dense_fqns, reshard_after_forward, mixed=mixed)
+                add_bucket(
+                    dense_fqns,
+                    reshard_after_forward,
+                    mixed=mixed,
+                    post_reduce_hook=(
+                        _finish_deferred_backward_of(model, expert_fqns[0])
+                        if reduce_experts_at_block_end
+                        else None
+                    ),
+                )
             )
         if owned_fqns:
             buckets_of_block.append(add_bucket(owned_fqns, reshard_after_forward))
@@ -345,6 +368,7 @@ def apply_flex_shard_to_decoder(
                 mesh=expert_mesh,
                 mixed=not fp8_weights.isdisjoint(experts),
                 experts=True,
+                defer_post_backward=reduce_experts_at_block_end,
             )
             buckets_of_block.append(expert_bucket)
             expert_buckets.append(expert_bucket)
@@ -441,6 +465,26 @@ def _declare_tensor_parallel_partial_grads(
                 and _per_axis_types(layout).get(MeshAxisName.TP) is spmd.R
             ):
                 set_partial_grad_group(param, tp_group)
+
+
+def _finish_deferred_backward_of(
+    model: nn.Module, param_fqn: str
+) -> Callable[[list[tuple[str, nn.Parameter]]], None]:
+    """A ``BucketSpec.post_reduce_hook`` that finishes the deferred post-backward
+    of the bucket holding ``param_fqn``: its reduce-scatter, then its reshard.
+
+    flex_shard runs the hook after the hooked bucket takes its grads and before
+    its own reduce-scatter, so the deferred bucket's reduce-scatter goes first.
+    The parameter is looked up when the hook runs, since flex_shard registers
+    the unsharded parameter during backward.
+    """
+
+    def hook(named_params: list[tuple[str, nn.Parameter]]) -> None:
+        # flex_shard() turns the model into a FlexShardModule.
+        # pyrefly: ignore [missing-attribute]
+        model.finish_deferred_backward(model.get_parameter(param_fqn))
+
+    return hook
 
 
 def _set_explicit_prefetch(
