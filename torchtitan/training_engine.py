@@ -20,7 +20,6 @@ from torchtitan.components.data.loader import BaseDataLoader
 from torchtitan.components.data.types import TrainingMicrobatch
 from torchtitan.components.loss import BaseLoss, ChunkedLossWrapper
 from torchtitan.components.optim import Optim
-from torchtitan.components.optim.optimizer import DistMuon
 from torchtitan.config import Configurable, TORCH_DTYPE_MAP
 from torchtitan.config.configs import CommConfig, DebugConfig, TrainingConfig
 from torchtitan.config.override import OverrideConfig
@@ -194,13 +193,6 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                             ),
                         ),
                         ("optim.ema", self.optim.ema is not None),
-                        (
-                            "DistMuon, which needs DTensor parameters",
-                            any(
-                                isinstance(optimizer, DistMuon.Config)
-                                for optimizer in self.optim.optimizer.optimizers
-                            ),
-                        ),
                     )
                     if enabled
                 ]
@@ -416,11 +408,24 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             self.pp_has_first_stage = True
             self.pp_has_last_stage = True
 
+        owned_params = config.parallelism.flex_shard_owned_params
+        owned_placement = None
+        if owned_params:
+            from torchtitan.distributed.flex_shard_fsdp import owned_placement_fn
+
+            # One for every model part: owners balance across virtual stages.
+            owned_placement = owned_placement_fn()
         with self.parallelism_context.activate_spmd():
             for model_part in self.model_parts:
                 model_part.to_empty(device=init_device)
                 with torch.no_grad():
                     model_part.init_weights(buffer_device=buffer_device)
+                if owned_params and hasattr(model_part, "sharded_bucket_storages"):
+                    from torchtitan.distributed.flex_shard_fsdp import (
+                        relayout_owned_buckets,
+                    )
+
+                    relayout_owned_buckets(model_part, owned_params, owned_placement)
                 model_part.train()
 
         if isinstance(self.loss_fn, ChunkedLossWrapper) and (
