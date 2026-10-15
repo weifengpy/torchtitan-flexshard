@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import itertools
 import unittest
 from functools import partial
 from unittest.mock import patch
@@ -23,6 +24,7 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 )
 
 from torchtitan.distributed.spmd_types import set_current_spmd_mesh
+from torchtitan.models.common.config_utils import fused_grouped_gate_up_param_init
 from torchtitan.models.common.linear import (
     ColumnParallelLinear,
     GroupedLinear,
@@ -189,6 +191,79 @@ class TestGroupedLinear(unittest.TestCase):
         )
 
         self.assertEqual(output_R2F.shape, torch.Size([5, 2, 8]))
+
+    def test_rows_on_dim0_views_the_stacked_layouts_rows(self):
+        """rows_on_dim0 stores the stacked layout's rows 2-D, and forward gives
+        the grouped GEMM the same [E, 2F, D] matrices."""
+        weights = {}
+
+        class StubGroupedLinear(GroupedLinear):
+            def _grouped_mm(self, *, input_RI, weight_EOI, offsets_E):
+                del offsets_E
+                weights[self.rows_on_dim0] = weight_EOI
+                return input_RI.new_zeros(input_RI.shape[0], weight_EOI.shape[1])
+
+        def build(rows_on_dim0: bool) -> GroupedLinear:
+            return StubGroupedLinear(
+                GroupedLinear.Config(
+                    group_size=3,
+                    in_features=4,
+                    out_features=8,
+                    num_linears=2,
+                    rows_on_dim0=rows_on_dim0,
+                )
+            )
+
+        stacked, flat = build(False), build(True)
+        self.assertEqual(flat.weight.shape, torch.Size([48, 4]))
+        with torch.no_grad():
+            stacked.weight.copy_(torch.randn(3, 2, 8, 4))
+            flat.weight.copy_(stacked.weight.reshape(48, 4))
+        input_RI = torch.randn(5, 4)
+        offsets_E = torch.tensor([2, 4, 5], dtype=torch.int32)
+        self.assertEqual(flat(input_RI, offsets_E).shape, torch.Size([5, 2, 8]))
+        stacked(input_RI, offsets_E)
+        self.assertTrue(torch.equal(weights[True], weights[False]))
+
+    def test_rows_on_dim0_initialization_does_not_depend_on_sharding(self):
+        """Every split of the 2-D weight's rows, including splits inside a
+        group's block, initializes to the unsharded weight's rows, and each
+        block gets its gate and up initializers."""
+
+        def build(init_seed: int = 1) -> GroupedLinear:
+            return GroupedLinear.Config(
+                group_size=3,
+                in_features=4,
+                out_features=8,
+                num_linears=2,
+                rows_on_dim0=True,
+                init_seed=init_seed,
+                param_init=fused_grouped_gate_up_param_init(
+                    {
+                        "w1_EFD": partial(nn.init.normal_, std=1.0),
+                        "w3_EFD": partial(nn.init.normal_, std=100.0),
+                    }
+                ),
+            ).build()
+
+        unsharded = build()
+        unsharded.init_states()
+        reference = unsharded.weight.detach().clone()
+        blocks = reference.view(3, 2, 8, 4)
+        self.assertLess(blocks[:, 0].abs().max().item(), 10)
+        self.assertGreater(blocks[:, 1].abs().max().item(), 10)
+        for bounds in ([0, 48], [0, 5, 13, 30, 48], [0, 16, 32, 48], [0, 0, 7, 48]):
+            sharded = build()
+            for start, end in itertools.pairwise(bounds):
+                sharded._init_rows(
+                    sharded.weight.data[start:end],
+                    start,
+                    sharded._param_init["weight"],
+                )
+            self.assertTrue(torch.equal(sharded.weight, reference), bounds)
+        other = build(init_seed=2)
+        other.init_states()
+        self.assertFalse(torch.equal(other.weight, reference))
 
 
 class TestTensorParallelLinearSpmdTypes(unittest.TestCase):
