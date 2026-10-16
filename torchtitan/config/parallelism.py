@@ -147,6 +147,20 @@ class ParallelismConfig:
     Needs every FP8 linear's dims to be whole 128-blocks.
     """
 
+    blockwise_fp8_routed_experts: bool = False
+    """
+    With ``flex_shard_blockwise_fp8`` or ``fsdp2_blockwise_fp8``, also run the
+    routed experts' grouped linears as blockwise FP8 GEMMs
+    (``torchtitan.distributed.blockwise_fp8_grouped``): FP8 forward and input
+    gradient with 128x128 weight blocks, and a BF16 weight gradient. FlexShard
+    all-gathers the experts' weights as FP8 blocks and the GEMM takes them as
+    gathered; FSDP2 all-gathers them in bf16 and the GEMM quantizes them on
+    every call. The routed experts' token dispatcher then pads each expert's
+    token group to a whole 128-row block, for any routing. Needs the experts'
+    dims to be whole 128-blocks, the all-to-all token dispatcher, and under
+    FlexShard their weights stored 2-D (``GroupedLinear`` ``rows_on_dim0``).
+    """
+
     fsdp2_native_collective_copy: bool = False
     """
     With ``fsdp_backend="fsdp2"``: copy parameters sharded on a nonzero dim
@@ -340,13 +354,17 @@ class ParallelismConfig:
                     f"parallelism.{name} requires parallelism.fsdp_backend="
                     f"'flex_shard' (got {self.fsdp_backend!r})"
                 )
-        if self.flex_shard_blockwise_fp8 and self.flex_shard_blockwise_fp8_dense_reference:
+        if (
+            self.flex_shard_blockwise_fp8
+            and self.flex_shard_blockwise_fp8_dense_reference
+        ):
             raise ValueError(
                 "Set at most one of parallelism.flex_shard_blockwise_fp8 and "
                 "parallelism.flex_shard_blockwise_fp8_dense_reference."
             )
         if self.flex_shard_owned_params and (
-            self.flex_shard_blockwise_fp8 or self.flex_shard_blockwise_fp8_dense_reference
+            self.flex_shard_blockwise_fp8
+            or self.flex_shard_blockwise_fp8_dense_reference
         ):
             raise ValueError(
                 "parallelism.flex_shard_owned_params doesn't support "
@@ -357,6 +375,14 @@ class ParallelismConfig:
             raise ValueError(
                 "parallelism.fsdp2_blockwise_fp8 requires parallelism.fsdp_backend="
                 f"'fsdp2' (got {self.fsdp_backend!r})"
+            )
+        if self.blockwise_fp8_routed_experts and not (
+            self.flex_shard_blockwise_fp8 or self.fsdp2_blockwise_fp8
+        ):
+            raise ValueError(
+                "parallelism.blockwise_fp8_routed_experts requires "
+                "parallelism.flex_shard_blockwise_fp8 or "
+                "parallelism.fsdp2_blockwise_fp8."
             )
         if self.fsdp2_native_collective_copy and self.fsdp_backend != "fsdp2":
             raise ValueError(
