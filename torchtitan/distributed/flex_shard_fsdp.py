@@ -194,13 +194,21 @@ def apply_flex_shard_to_decoder(
         }
 
     fp8_weights: set[nn.Parameter] = set()
-    mixed_placement_fn = None
+    mixed_placement_fn = expert_mixed_placement_fn = None
     if blockwise_fp8 or blockwise_fp8_dense_reference:
         from torchtitan.distributed import flex_shard_blockwise_fp8
 
         fp8_weights = flex_shard_blockwise_fp8.blockwise_fp8_weights(model)
         mixed_placement_fn = flex_shard_blockwise_fp8.make_mixed_placement_fn(
             model, placement_fn, dense_reference=blockwise_fp8_dense_reference
+        )
+        # FP8 routed experts (parallelism.blockwise_fp8_routed_experts) keep
+        # block-row units: their initialization draws whole rows.
+        expert_mixed_placement_fn = flex_shard_blockwise_fp8.make_mixed_placement_fn(
+            model,
+            placement_fn,
+            dense_reference=blockwise_fp8_dense_reference,
+            row_blocks=True,
         )
 
     buckets: list[BucketSpec] = []
@@ -212,11 +220,18 @@ def apply_flex_shard_to_decoder(
         mesh: DeviceMesh = dp_mesh,
         *,
         mixed: bool = False,
+        experts: bool = False,
     ) -> int:
+        if mixed:
+            bucket_placement_fn = (
+                expert_mixed_placement_fn if experts else mixed_placement_fn
+            )
+        else:
+            bucket_placement_fn = placement_fn
         buckets.append(
             BucketSpec(
                 patterns,
-                placement_fn=mixed_placement_fn if mixed else placement_fn,
+                placement_fn=bucket_placement_fn,
                 mesh=mesh,
                 mp_policy=mp_policy,
                 gradient_divide_factor=1.0,
@@ -325,7 +340,11 @@ def apply_flex_shard_to_decoder(
             buckets_of_block.append(add_bucket(owned_fqns, reshard_after_forward))
         if expert_fqns:
             expert_bucket = add_bucket(
-                expert_fqns, reshard_after_forward, mesh=expert_mesh
+                expert_fqns,
+                reshard_after_forward,
+                mesh=expert_mesh,
+                mixed=not fp8_weights.isdisjoint(experts),
+                experts=True,
             )
             buckets_of_block.append(expert_bucket)
             expert_buckets.append(expert_bucket)
