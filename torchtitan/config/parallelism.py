@@ -147,6 +147,16 @@ class ParallelismConfig:
     Needs every FP8 linear's dims to be whole 128-blocks.
     """
 
+    fsdp2_native_collective_copy: bool = False
+    """
+    With ``fsdp_backend="fsdp2"``: copy parameters sharded on a nonzero dim
+    straight between their layout and the collective buffers, with FSDP2's
+    native collective copies (``torch.distributed.fsdp.experimental``,
+    experimental). By default FSDP2 reassembles such a parameter after every
+    all-gather and reorders its gradient before every reduce-scatter, an extra
+    copy each way, e.g. for a stacked ``[2, F, D]`` w13 sharded on ``F``.
+    """
+
     tensor_parallel_degree: int = 1
     """Tensor Parallelism degree. 1 means disabled."""
 
@@ -347,6 +357,11 @@ class ParallelismConfig:
             raise ValueError(
                 "parallelism.fsdp2_blockwise_fp8 requires parallelism.fsdp_backend="
                 f"'fsdp2' (got {self.fsdp_backend!r})"
+            )
+        if self.fsdp2_native_collective_copy and self.fsdp_backend != "fsdp2":
+            raise ValueError(
+                "parallelism.fsdp2_native_collective_copy requires "
+                f"parallelism.fsdp_backend='fsdp2' (got {self.fsdp_backend!r})"
             )
         if self.fsdp_backend == "flex_shard":
             unsupported = [

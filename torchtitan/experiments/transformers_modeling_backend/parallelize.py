@@ -24,6 +24,7 @@ from torchtitan.distributed import ParallelismContext
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
 from torchtitan.distributed.fsdp import (
     disable_fsdp_gradient_division,
+    enable_fsdp_native_collective_copy,
     enable_fsdp_symm_mem,
     get_fsdp_reshard_after_forward_policy,
 )
@@ -210,6 +211,7 @@ def apply_fsdp(
     gradient_divide_factor: int | None = None,
     symm_mem_scope: FSDPSymmMemScope = None,
     separate_reduce_scatter_group: bool = False,
+    native_collective_copy: bool = False,
 ):
     """Apply data parallelism (via FSDP2) to the model.
 
@@ -338,6 +340,8 @@ def apply_fsdp(
 
     if separate_reduce_scatter_group:
         model.set_separate_reduce_scatter_group()
+    if native_collective_copy:
+        enable_fsdp_native_collective_copy(model)
 
     enable_fsdp_symm_mem(model, symm_mem_scope)
 
