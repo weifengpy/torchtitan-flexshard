@@ -159,6 +159,14 @@ class BaseModel(Module, ABC):
                 convert_blockwise_fp8_linears(
                     self, use_triton=parallelism.flex_shard_blockwise_fp8_use_triton
                 )
+            elif parallelism.fsdp2_blockwise_fp8:
+                from torchtitan.distributed.fsdp2_blockwise_fp8 import (
+                    convert_fsdp2_blockwise_fp8_linears,
+                )
+
+                # Before _parallelize, so the FP8 linears get the sharding of
+                # the linears they replace.
+                convert_fsdp2_blockwise_fp8_linears(self)
             self._parallelize(parallelism_context)
             if ac_config is not None:
                 ac_config.build(dump_folder=dump_folder).apply(self)
