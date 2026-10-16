@@ -380,6 +380,13 @@ def apply_flex_shard_to_decoder(
             head_bucket=head_bucket,
             expert_buckets=expert_buckets,
         )
+        # A MoE layer is two buckets, its routed experts and the rest. With one
+        # pending reduce-grad, the dense bucket's reduce-scatter first waits for
+        # the expert reduce-scatter issued just before it, in the same layer, and
+        # so do the compute stream and the next backward all-gathers. FSDP2 holds
+        # both parameter groups in one module per layer and waits for the
+        # previous layer's reduce-scatter instead; two pending match that.
+        model.set_max_pending_reduce_grads(2)
     logger.info("Applied FlexShard to the model")
 
 
