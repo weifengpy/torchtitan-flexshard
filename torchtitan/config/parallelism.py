@@ -171,6 +171,19 @@ class ParallelismConfig:
     copy each way, e.g. for a stacked ``[2, F, D]`` w13 sharded on ``F``.
     """
 
+    fsdp2_nested_routed_experts: bool = False
+    """
+    With ``fsdp_backend="fsdp2"`` and expert parallelism: shard each MoE
+    block's routed experts with a ``fully_shard`` of their own, nested in the
+    block's, as torchtitan did before per-parameter meshes. By default they are
+    a second parameter group of the block's FSDP module, whose post-backward
+    runs when the whole block's backward ends, so their gradient reduce-scatter
+    starts only then. Nested, it starts when the routed experts' backward ends,
+    as FlexShard's expert bucket does. Each block still prefetches its own and
+    its experts' all-gathers together, and FSDP2 keeps two reduce-scatter input
+    buffers, so a block's reduce-scatter doesn't wait for its experts'.
+    """
+
     tensor_parallel_degree: int = 1
     """Tensor Parallelism degree. 1 means disabled."""
 
@@ -387,6 +400,11 @@ class ParallelismConfig:
         if self.fsdp2_native_collective_copy and self.fsdp_backend != "fsdp2":
             raise ValueError(
                 "parallelism.fsdp2_native_collective_copy requires "
+                f"parallelism.fsdp_backend='fsdp2' (got {self.fsdp_backend!r})"
+            )
+        if self.fsdp2_nested_routed_experts and self.fsdp_backend != "fsdp2":
+            raise ValueError(
+                "parallelism.fsdp2_nested_routed_experts requires "
                 f"parallelism.fsdp_backend='fsdp2' (got {self.fsdp_backend!r})"
             )
         if self.fsdp_backend == "flex_shard":

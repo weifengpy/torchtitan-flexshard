@@ -10,6 +10,7 @@ import pytest
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import Shard
 from torch.testing._internal.distributed._tensor.common_dtensor import (
     DTensorTestBase,
@@ -308,6 +309,100 @@ class TestApplyFsdpMoESharding(DTensorTestBase):
                     for replica in ep_replicas[1:]:
                         self.assertEqual(replica, ep_replicas[0])
                 model.load_state_dict(state_dict)
+
+    @with_comms
+    def test_with_ep_nested_routed_experts_match_parameter_group(self):
+        """Nested routed experts are FSDP modules of their own on the sparse
+        mesh, prefetched with their blocks, under two reduce-scatter input
+        buffers, and give the same gradients as a second parameter group."""
+        parallelism_context = ParallelismContext(
+            dp_replicate=1,
+            dp_shard=self.world_size,
+            cp=1,
+            tp=1,
+            pp=1,
+            ep=2,
+            world_size=self.world_size,
+            enable_sequence_parallel=False,
+        )
+        parallelism_context.build_mesh()
+        dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallelism_context)
+        edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallelism_context)
+        assert edp_mesh is not None
+
+        grads = []
+        for nested in (False, True):
+            config = _qwen3_moe_config(num_experts=8)
+            set_qwen3_sharding_config(config, enable_sp=False, enable_ep=True)
+            torch.manual_seed(0)
+            model = config.build().to(self.device_type)
+            model.init_states()
+            model._parallelize(parallelism_context)
+            apply_fsdp_to_decoder(
+                model,
+                dp_mesh,
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.float32,
+                pp_enabled=False,
+                ep_degree=2,
+                edp_mesh=edp_mesh,
+                dp_mesh_dims=dp_mesh_dims,
+                edp_mesh_dims=edp_mesh_dims,
+                nested_routed_experts=nested,
+            )
+
+            blocks = list(model.layers.values())
+            for block in blocks:
+                routed_experts = block.moe.routed_experts
+                self.assertEqual(isinstance(routed_experts, FSDPModule), nested)
+                self.assertEqual(
+                    len(block._get_fsdp_state()._fsdp_param_groups), 1 if nested else 2
+                )
+                self.assertIs(routed_experts.w13.weight.device_mesh, edp_mesh)
+            if nested:
+                states = [
+                    (
+                        block._get_fsdp_state(),
+                        block.moe.routed_experts._get_fsdp_state(),
+                    )
+                    for block in blocks
+                ]
+                # Forward gathers a block's dense parameters first, backward its
+                # experts first, as FSDP2 orders a module's parameter groups.
+                self.assertEqual(
+                    blocks[0]._get_fsdp_state()._states_to_forward_prefetch,
+                    list(states[1]),
+                )
+                self.assertEqual(
+                    blocks[1]._get_fsdp_state()._states_to_backward_prefetch,
+                    list(reversed(states[0])),
+                )
+
+            tokens = (
+                torch.arange(8, device=self.device_type) + 8 * self.rank
+            ) % config.vocab_size
+            positions = torch.arange(8, device=self.device_type)
+            attention_metadata = model._get_attention_metadata(positions)
+            with parallelism_context.activate_spmd():
+                model(
+                    tokens,
+                    positions=positions,
+                    attention_metadata=attention_metadata,
+                ).sum().backward()
+            self.assertEqual(
+                model._get_fsdp_state()._comm_ctx.reduce_scatter_max_input_buffers,
+                2 if nested else 1,
+            )
+            grads.append(
+                {
+                    name: param.grad.to_local().clone()
+                    for name, param in model.named_parameters()
+                }
+            )
+
+        self.assertEqual(grads[1].keys(), grads[0].keys())
+        for name, grad in grads[0].items():
+            self.assertTrue(torch.equal(grads[1][name], grad), name)
 
     @with_comms
     def test_no_ep_hsdp_ignores_dp_replicate(self):
