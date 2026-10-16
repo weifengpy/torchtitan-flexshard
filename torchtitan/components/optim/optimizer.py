@@ -208,6 +208,11 @@ class DistMuon(FlexShardDistMuon, BaseOptimizer):
         # Ranks per host, for placing whole-matrix owners on different hosts
         # first. None reads torchrun's LOCAL_WORLD_SIZE.
         ranks_per_host: int | None = None
+        owner_by_fqn: Mapping[str, int] = field(default_factory=dict)
+        """Fixed owners of ``Owned`` parameters, as ranks on their
+        redistribution mesh axis (e.g. ``dp_shard``); DistMuon balances the
+        other ``Owned`` parameters around them. Entries for parameters on other
+        pipeline stages are ignored."""
 
     def __init__(
         self,
@@ -228,6 +233,7 @@ class DistMuon(FlexShardDistMuon, BaseOptimizer):
             ns_steps=config.ns_steps,
             adjust_lr_fn=config.adjust_lr_fn,
             ranks_per_host=config.ranks_per_host,
+            owner_by_fqn=config.owner_by_fqn,
         )
 
 
@@ -259,14 +265,19 @@ class _LocalDistMuon(DistMuon):
 
 def _local_compute_layout(compute_layout: ComputeLayout, axis: str) -> ComputeLayout:
     """The compute layout on a one-rank mesh axis that gives DistMuon the matrix
-    views it gives the data-parallel layout: blocks for ``BlockShard``, the
-    whole local tensor otherwise."""
+    views it gives the data-parallel layout: blocks for ``BlockShard`` and
+    ``Owned`` with blocks, the whole local tensor otherwise."""
     shardings = [
         sharding
         for sharding in compute_layout.shardings_by_mesh_axis.values()
         if not isinstance(sharding, Replicate)
     ]
-    blocks = [sharding for sharding in shardings if isinstance(sharding, BlockShard)]
+    blocks = []
+    for sharding in shardings:
+        if isinstance(sharding, BlockShard):
+            blocks.append(sharding)
+        elif isinstance(sharding, Owned) and sharding.block_sizes is not None:
+            blocks.append(BlockShard(dim=0, block_sizes=sharding.block_sizes))
     if blocks:
         sharding = blocks[0]
     elif any(isinstance(sharding, Owned) for sharding in shardings):
@@ -342,6 +353,8 @@ def _build_flex_shard_dist_muon(
                 fqn: _local_compute_layout(config.compute_sharding_by_fqn[fqn], axis)
                 for fqn in group["param_names"]
             },
+            # FlexShard already stores each parameter on its owner.
+            owner_by_fqn={},
         )
         return _LocalDistMuon(local_config, params=param_groups)
 
