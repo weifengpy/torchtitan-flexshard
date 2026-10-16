@@ -160,13 +160,20 @@ class BaseModel(Module, ABC):
                     self, use_triton=parallelism.flex_shard_blockwise_fp8_use_triton
                 )
             elif parallelism.fsdp2_blockwise_fp8:
-                from torchtitan.distributed.fsdp2_blockwise_fp8 import (
-                    convert_fsdp2_blockwise_fp8_linears,
-                )
-
                 # Before _parallelize, so the FP8 linears get the sharding of
                 # the linears they replace.
-                convert_fsdp2_blockwise_fp8_linears(self)
+                if parallelism.fsdp2_blockwise_fp8_quantize_per_gather:
+                    from torchtitan.distributed.fsdp2_blockwise_fp8_per_gather import (
+                        convert_fsdp2_blockwise_fp8_linears_quantize_per_gather,
+                    )
+
+                    convert_fsdp2_blockwise_fp8_linears_quantize_per_gather(self)
+                else:
+                    from torchtitan.distributed.fsdp2_blockwise_fp8 import (
+                        convert_fsdp2_blockwise_fp8_linears,
+                    )
+
+                    convert_fsdp2_blockwise_fp8_linears(self)
             self._parallelize(parallelism_context)
             if ac_config is not None:
                 ac_config.build(dump_folder=dump_folder).apply(self)
