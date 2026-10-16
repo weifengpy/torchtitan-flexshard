@@ -28,6 +28,7 @@ __all__ = [
     "apply_fsdp_to_decoder",
     "apply_fsdp_to_multimodal_encoder",
     "disable_fsdp_gradient_division",
+    "enable_fsdp_native_collective_copy",
     "enable_fsdp_symm_mem",
     "get_fsdp_reshard_after_forward_policy",
     "linear_param_shard_placements",
@@ -283,6 +284,27 @@ def disable_fsdp_gradient_division(model: nn.Module) -> None:
             module.set_gradient_divide_factor(1.0)
 
 
+def enable_fsdp_native_collective_copy(model: FSDPModule) -> None:
+    """Copy parameters sharded on a nonzero dim, e.g. a stacked ``[2, F, D]`` w13
+    sharded on ``F``, straight between their layout and the collective buffers.
+
+    Installs FSDP2's native all-gather copy-out and reduce-scatter copy-in
+    (``torch.distributed.fsdp.experimental``) on every FSDP module under
+    ``model``, in place of the default reassembly after each all-gather and
+    reorder before each reduce-scatter.
+    """
+    from torch.distributed.fsdp.experimental import (
+        all_gather_output_fn_with_native_copy,
+        DefaultAllGatherLayout,
+        reduce_scatter_input_fn_with_native_copy,
+    )
+
+    model.set_all_gather_layout(
+        DefaultAllGatherLayout(all_gather_output_fn_with_native_copy)
+    )
+    model.set_reduce_scatter_input_fn(reduce_scatter_input_fn_with_native_copy)
+
+
 def enable_fsdp_symm_mem(model: nn.Module, scope: FSDPSymmMemScope) -> None:
     """Enable symmetric-memory communication for the FSDP modules ``scope`` selects."""
     if scope is None:
@@ -378,6 +400,7 @@ def apply_fsdp_to_decoder(
     *,
     param_dtype_override_fn: Callable[[nn.Parameter], torch.dtype | None] | None = None,
     separate_reduce_scatter_group: bool = False,
+    native_collective_copy: bool = False,
 ):
     """
     Apply data parallelism (via FSDP2) to a decoder-style transformer model.
@@ -423,6 +446,9 @@ def apply_fsdp_to_decoder(
         separate_reduce_scatter_group: Whether gradient reduce-scatters run on a
             process group of their own
             (``FSDPModule.set_separate_reduce_scatter_group``).
+        native_collective_copy: Whether parameters sharded on a nonzero dim copy
+            straight between their layout and the collective buffers
+            (``enable_fsdp_native_collective_copy``).
     """
     mp_policy = MixedPrecisionPolicy(
         param_dtype=param_dtype,
@@ -574,6 +600,8 @@ def apply_fsdp_to_decoder(
 
     if separate_reduce_scatter_group:
         model.set_separate_reduce_scatter_group()
+    if native_collective_copy:
+        enable_fsdp_native_collective_copy(model)
 
     enable_fsdp_symm_mem(model, symm_mem_scope)
 

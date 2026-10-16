@@ -234,6 +234,7 @@ class HFTransformerModel(BaseModel):
             separate_reduce_scatter_group=(
                 parallelism.fsdp_separate_reduce_scatter_group
             ),
+            native_collective_copy=parallelism.fsdp2_native_collective_copy,
             ep_degree=parallelism_context.ep,
             dp_mod_ep_mesh=edp_mesh,
             dp_mesh_dims=dp_mesh_dims,
