@@ -173,6 +173,7 @@ class Decoder(BaseModel):
                 reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
                 ep_degree=parallelism_context.ep,
                 edp_mesh=edp_mesh,
+                owned_param_patterns=parallelism.flex_shard_owned_params,
             )
             return
         apply_fsdp_to_decoder(

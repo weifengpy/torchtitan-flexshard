@@ -26,6 +26,21 @@ from torchtitan.models.deepseek_v3.model import Attention as DeepSeekV3Attention
 from torchtitan.trainer import Trainer
 
 
+# With parallelism.fsdp_backend="flex_shard", the parameters FlexShard stores
+# whole on owners (parallelism.flex_shard_owned_params), so DistMuon's step needs
+# no communication: those mla_dist_muon_optimizer gives Owned compute layouts;
+# wkv_a, whose one block pattern ([kv_latent; k_rope]) is the whole matrix; and
+# w13, whose gate and up DistMuon computes apart, each as a batch of one, which
+# FSDP2's row shards mix. On one owner they run as one batch of two, which gives
+# the same bits (checked on H100 for the debug model's and DeepSeek V3's shapes).
+# The row shards of the other Muon parameters hold whole heads or experts.
+MLA_DIST_MUON_OWNED_PARAMS = (
+    r"\.attention\.(?:wq_a|wkv_a|wo)\.weight$",
+    r"\.moe\.router\.gate\.weight$",
+    r"\.(?:feed_forward|moe\.shared_experts)\.(?:w13|w2)\.weight$",
+)
+
+
 def per_expert_compute_layout(parallelism: ParallelismConfig) -> ComputeLayout:
     ep_size = parallelism.expert_parallel_degree
     if ep_size <= 0:
@@ -287,7 +302,8 @@ def align_dist_muon_expert_compute_layouts(
 @dataclass(kw_only=True, slots=True)
 class DistMuonTrainerConfig(Trainer.Config):
     """Trainer config for recipes with ``mla_dist_muon_optimizer``: aligns the
-    routed-expert layouts with the final parallelism."""
+    routed-expert layouts with the final parallelism, and with FlexShard stores
+    the matrices DistMuon computes whole on one rank on owners."""
 
     def __post_init__(self) -> None:
         Trainer.Config.__post_init__(self)
@@ -295,6 +311,11 @@ class DistMuonTrainerConfig(Trainer.Config):
             self.optim.optimizer,
             parallelism=self.parallelism,
         )
+        if (
+            self.parallelism.fsdp_backend == "flex_shard"
+            and not self.parallelism.flex_shard_owned_params
+        ):
+            self.parallelism.flex_shard_owned_params = list(MLA_DIST_MUON_OWNED_PARAMS)
         # TODO(#3353): Support TP-produced _StridedShard layouts in DistMuon.
         if self.parallelism.tensor_parallel_degree > 1:
             # Fail during config parsing, before TP/FSDP creates _StridedShard
