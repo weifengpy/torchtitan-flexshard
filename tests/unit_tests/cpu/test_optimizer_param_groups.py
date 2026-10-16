@@ -441,6 +441,51 @@ class TestOptimizerConfig(unittest.TestCase):
         with self.assertRaises(ValueError):
             config.build(model_parts=[model])
 
+    def test_flex_shard_dist_muon_without_local_params(self):
+        """A FlexShard rank that stores none of a model part's Muon parameters
+        (each whole on another owner) gets no DistMuon for that part: the
+        parameters still count as assigned, zero_grad clears their grads, and
+        the other optimizers run as usual."""
+        from unittest import mock
+
+        from torchtitan.components.optim import DistMuon
+
+        model = SimpleModel()
+        # FlexShard's root modules carry bucket_storage_of.
+        model.bucket_storage_of = lambda param: None
+        config = OptimizersContainer.Config(
+            optimizers=[
+                DistMuon.Config(
+                    pattern=r"layers\.0\.(?:attention|ff)\.weight$",
+                    compute_sharding_by_fqn={},
+                    bucket_configs=(),
+                ),
+                _DEFAULT_ADAMW,
+            ],
+        )
+        with mock.patch(
+            "torchtitan.components.optim.optimizer._build_flex_shard_dist_muon",
+            return_value=None,
+        ):
+            container = config.build(model_parts=[model])
+        muon_params = [
+            model.layers["0"]["attention"].weight,
+            model.layers["0"]["ff"].weight,
+        ]
+        self.assertEqual(
+            [type(optimizer).__name__ for optimizer in container.optimizers],
+            ["AdamW"],
+        )
+        self.assertEqual(
+            [id(p) for p in container.params_without_local_optimizer],
+            [id(p) for p in muon_params],
+        )
+        model(torch.randint(0, 32, (2, 4))).sum().backward()
+        container.step()
+        container.zero_grad()
+        for param in model.parameters():
+            self.assertIsNone(param.grad)
+
 
 class TestOptimizersContainerWithParamGroups(unittest.TestCase):
     def test_build_optimizer_with_param_groups(self):
