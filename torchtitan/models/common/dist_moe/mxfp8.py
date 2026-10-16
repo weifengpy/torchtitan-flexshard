@@ -8,6 +8,9 @@
 
 from __future__ import annotations
 
+import functools
+import math
+import sys
 from dataclasses import dataclass, field
 
 import torch
@@ -66,41 +69,81 @@ def _prepare_mxfp8_weight(
     )
 
 
+def _grouped_compute_view(
+    tensor: torch.Tensor, rows_per_group: int | None, *, gate_up: bool
+) -> torch.Tensor:
+    """Return ``tensor``, a W13 ``[E, 2, F, D]`` or W2 ``[E, D, F]`` weight or
+    their 2-D storage with ``rows_per_group`` rows per expert, as the grouped
+    ``[E, out, in]`` view Dist-MoE computes with."""
+    if rows_per_group is not None:
+        return tensor.view(-1, rows_per_group, tensor.shape[-1])
+    return tensor.flatten(1, 2) if gate_up else tensor
+
+
 class _DistMoeW13ShardedTensor(_ShardedFSDPTensor):
     """Persistent W13 parameter that prepares grouped MXFP8 compute operands."""
+
+    # Rows per expert of a weight stored 2-D (GroupedLinear rows_on_dim0), set by
+    # the subclass _rows_on_dim0_type creates; None for the stacked layout.
+    _rows_per_group: int | None = None
 
     def _build_operands(
         self,
         logical_tensor: torch.Tensor,
         out: _DistMoeMXFP8Operands | None = None,
     ) -> _DistMoeMXFP8Operands:
-        return _prepare_mxfp8_weight(logical_tensor.flatten(1, 2), out)
+        return _prepare_mxfp8_weight(
+            _grouped_compute_view(logical_tensor, self._rows_per_group, gate_up=True),
+            out,
+        )
 
 
 class _DistMoeW2ShardedTensor(_ShardedFSDPTensor):
     """Persistent W2 parameter that prepares grouped MXFP8 compute operands."""
 
+    _rows_per_group: int | None = None
+
     def _build_operands(
         self,
         logical_tensor: torch.Tensor,
         out: _DistMoeMXFP8Operands | None = None,
     ) -> _DistMoeMXFP8Operands:
-        return _prepare_mxfp8_weight(logical_tensor, out)
+        return _prepare_mxfp8_weight(
+            _grouped_compute_view(logical_tensor, self._rows_per_group, gate_up=False),
+            out,
+        )
+
+
+@functools.cache
+def _rows_on_dim0_type(base: type, rows_per_group: int) -> type:
+    """``base`` for a weight stored 2-D with ``rows_per_group`` rows per expert.
+
+    The row count rides on the type, not the instance, because FSDP re-wraps
+    each shard with ``type(template)``. The type is a module attribute, so
+    pickling finds it by name.
+    """
+    name = f"{base.__name__}Rows{rows_per_group}"
+    cls = type(
+        name, (base,), {"_rows_per_group": rows_per_group, "__module__": __name__}
+    )
+    setattr(sys.modules[__name__], name, cls)
+    return cls
 
 
 def _dynamic_prepared_weight(
     logical_weight: torch.Tensor,
     *,
     gate_up: bool,
+    rows_per_group: int | None = None,
 ) -> dist_moe.PreparedWeight:
     """Prepare a weight when FSDP does not own its unshard lifetime."""
-    source = logical_weight.flatten(1, 2) if gate_up else logical_weight
+    source = _grouped_compute_view(logical_weight, rows_per_group, gate_up=gate_up)
     storage = (
         logical_weight._tensor
         if isinstance(logical_weight, _ShardedFSDPTensor)
         else logical_weight
     )
-    compute_weight = storage.flatten(1, 2) if gate_up else storage
+    compute_weight = _grouped_compute_view(storage, rows_per_group, gate_up=gate_up)
     with torch.no_grad():
         operands = _prepare_mxfp8_weight(compute_weight)
     return operands.prepared(source)
@@ -148,14 +191,24 @@ class MXFP8DistMoeRoutedExperts(DistMoeRoutedExperts):
     def __init__(self, config: Config):
         super().__init__(config)
         self.block_scaled_config = config.block_scaled_config
+        w13_type, w2_type = _DistMoeW13ShardedTensor, _DistMoeW2ShardedTensor
+        if self.w13.rows_on_dim0:
+            w13_type = _rows_on_dim0_type(w13_type, self._rows_per_group(self.w13))
+        if self.w2.rows_on_dim0:
+            w2_type = _rows_on_dim0_type(w2_type, self._rows_per_group(self.w2))
         self.w13.weight = torch.nn.Parameter(
-            _DistMoeW13ShardedTensor(self.w13.weight.data),
+            w13_type(self.w13.weight.data),
             requires_grad=self.w13.weight.requires_grad,
         )
         self.w2.weight = torch.nn.Parameter(
-            _DistMoeW2ShardedTensor(self.w2.weight.data),
+            w2_type(self.w2.weight.data),
             requires_grad=self.w2.weight.requires_grad,
         )
+
+    @staticmethod
+    def _rows_per_group(linear) -> int | None:
+        """Rows per expert of ``linear``'s weight stored 2-D, else None."""
+        return math.prod(linear._output_shape) if linear.rows_on_dim0 else None
 
     def _weight_operands(
         self,
@@ -166,15 +219,20 @@ class MXFP8DistMoeRoutedExperts(DistMoeRoutedExperts):
         """Return prepared W13 and W2 operands for this unshard lifetime."""
         w13_E2FD = self.w13.weight
         w2_EDF = self.w2.weight
-        w13_EFD = w13_E2FD.flatten(1, 2)
+        w13_rows = self._rows_per_group(self.w13)
+        w2_rows = self._rows_per_group(self.w2)
+        w13_EFD = _grouped_compute_view(w13_E2FD, w13_rows, gate_up=True)
+        w2_source = _grouped_compute_view(w2_EDF, w2_rows, gate_up=False)
         w13_operand = (
             w13_E2FD.operands.prepared(w13_EFD)
             if isinstance(w13_E2FD, _UnshardedFSDPTensor)
-            else _dynamic_prepared_weight(w13_E2FD, gate_up=True)
+            else _dynamic_prepared_weight(
+                w13_E2FD, gate_up=True, rows_per_group=w13_rows
+            )
         )
         w2_operand = (
-            w2_EDF.operands.prepared(w2_EDF)
+            w2_EDF.operands.prepared(w2_source)
             if isinstance(w2_EDF, _UnshardedFSDPTensor)
-            else _dynamic_prepared_weight(w2_EDF, gate_up=False)
+            else _dynamic_prepared_weight(w2_EDF, gate_up=False, rows_per_group=w2_rows)
         )
         return w13_operand, w2_operand
