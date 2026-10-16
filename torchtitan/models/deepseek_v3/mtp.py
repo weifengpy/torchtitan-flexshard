@@ -289,6 +289,7 @@ class MTPDecoder(Decoder):
                 parallelism.fsdp_separate_reduce_scatter_group
             ),
             native_collective_copy=parallelism.fsdp2_native_collective_copy,
+            nested_routed_experts=parallelism.fsdp2_nested_routed_experts,
         )
 
     def preprocess_inputs(
@@ -509,6 +510,7 @@ def apply_fsdp_to_mtp_decoder(
     symm_mem_scope: FSDPSymmMemScope = None,
     separate_reduce_scatter_group: bool = False,
     native_collective_copy: bool = False,
+    nested_routed_experts: bool = False,
 ) -> None:
     mtp_layer_keys = []
     try:
@@ -534,6 +536,7 @@ def apply_fsdp_to_mtp_decoder(
             symm_mem_scope=symm_mem_scope,
             separate_reduce_scatter_group=separate_reduce_scatter_group,
             native_collective_copy=native_collective_copy,
+            nested_routed_experts=nested_routed_experts,
         )
     finally:
         for key in mtp_layer_keys:

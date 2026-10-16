@@ -309,10 +309,19 @@ def enable_fsdp_symm_mem(model: nn.Module, scope: FSDPSymmMemScope) -> None:
     """Enable symmetric-memory communication for the FSDP modules ``scope`` selects."""
     if scope is None:
         return
+    # With parallelism.fsdp2_nested_routed_experts, routed experts are FSDP
+    # modules of their own, which "dense" skips like their MoE blocks.
+    routed_experts = {
+        module.routed_experts
+        for module in model.modules()
+        if isinstance(getattr(module, "routed_experts", None), nn.Module)
+    }
     for module in model.modules():
         if not isinstance(module, FSDPModule):
             continue
-        if scope == "dense" and getattr(module, "moe_enabled", False):
+        if scope == "dense" and (
+            getattr(module, "moe_enabled", False) or module in routed_experts
+        ):
             continue
         module.set_force_sum_reduction_for_comms(True)
         module.set_symm_mem_for_comm()
@@ -401,6 +410,7 @@ def apply_fsdp_to_decoder(
     param_dtype_override_fn: Callable[[nn.Parameter], torch.dtype | None] | None = None,
     separate_reduce_scatter_group: bool = False,
     native_collective_copy: bool = False,
+    nested_routed_experts: bool = False,
 ):
     """
     Apply data parallelism (via FSDP2) to a decoder-style transformer model.
@@ -449,7 +459,16 @@ def apply_fsdp_to_decoder(
         native_collective_copy: Whether parameters sharded on a nonzero dim copy
             straight between their layout and the collective buffers
             (``enable_fsdp_native_collective_copy``).
+        nested_routed_experts: With EP > 1, whether each MoE block's routed
+            experts get a ``fully_shard`` of their own on ``edp_mesh``, nested in
+            the block's, instead of a second parameter group of the block's
+            (``parallelism.fsdp2_nested_routed_experts``).
     """
+    if nested_routed_experts and ep_degree == 1:
+        logger.warning(
+            "parallelism.fsdp2_nested_routed_experts has no effect without "
+            "expert parallelism: routed experts share their block's FSDP mesh."
+        )
     mp_policy = MixedPrecisionPolicy(
         param_dtype=param_dtype,
         reduce_dtype=reduce_dtype,
@@ -494,6 +513,8 @@ def apply_fsdp_to_decoder(
                 reshard_after_forward=reshard_after_forward_policy == "always",
             )
 
+    # Each MoE block whose routed experts got a nested fully_shard -> those experts.
+    nested_experts: dict[nn.Module, nn.Module] = {}
     for layer_id, transformer_block in model.layers.items():
         # A stacked Linear keeps W1/W3 separate from the matrix-row dimension.
         # Shard matrix rows so every rank retains both projections.
@@ -541,6 +562,28 @@ def apply_fsdp_to_decoder(
                     # Shard(0), matching shard_placement_fn's contract.
                     shard_placement_fn=param_placements.get,
                 )
+            elif nested_routed_experts:
+                # The routed experts' own FSDP module runs its post-backward,
+                # and so issues their reduce-scatter, when their backward ends;
+                # the block's runs when the whole block's backward ends.
+                assert edp_mesh is not None
+                expert_fsdp_config: dict[str, Any] = {**fsdp_config, "mesh": edp_mesh}
+                expert_fsdp_config.pop("dp_mesh_dims", None)
+                if edp_mesh_dims is not None:
+                    expert_fsdp_config["dp_mesh_dims"] = edp_mesh_dims
+                fully_shard(
+                    routed_experts,
+                    **expert_fsdp_config,
+                    reshard_after_forward=reshard_after_forward,
+                    shard_placement_fn=expert_param_placements.get,
+                )
+                fully_shard(
+                    transformer_block,
+                    **fsdp_config,
+                    reshard_after_forward=reshard_after_forward,
+                    shard_placement_fn=stacked_param_placements.get,
+                )
+                nested_experts[transformer_block] = routed_experts
             else:
                 # ep_degree > 1: per-param mesh
                 from torch.distributed.fsdp._fully_shard._fsdp_common import (
@@ -598,6 +641,14 @@ def apply_fsdp_to_decoder(
 
     fully_shard(model, **fsdp_config)
 
+    if nested_experts:
+        # A block's reduce-scatter comes right after its nested experts'. With
+        # FSDP2's one reduce-scatter input buffer, the block's would first wait
+        # for the experts' to finish, and so would the compute stream; with two,
+        # each waits only for its counterpart in the previous block, as with
+        # both parameter groups in one module.
+        # pyrefly: ignore [not-callable]
+        model.set_reduce_scatter_max_input_buffers(2)
     if separate_reduce_scatter_group:
         model.set_separate_reduce_scatter_group()
     if native_collective_copy:
@@ -621,19 +672,32 @@ def apply_fsdp_to_decoder(
     if ep_degree == 1:
         return
 
+    def prefetch_targets(block: nn.Module, *, backward: bool = False) -> list:
+        # A block's nested routed experts are gathered with the block, in the
+        # order its two parameter groups would be: in backward, which runs the
+        # experts before attention, the experts first.
+        experts = nested_experts.get(block)
+        if experts is None:
+            return [block]
+        return [experts, block] if backward else [block, experts]
+
     # set up explicit prefetching when EP is enabled for forward
     transformer_blocks = list(model.layers.values())
     next_transformer_blocks = transformer_blocks[1:] + [None]
 
     if model.tok_embeddings is not None and len(model.layers) > 0:
-        model.tok_embeddings.set_modules_to_forward_prefetch([transformer_blocks[0]])
+        model.tok_embeddings.set_modules_to_forward_prefetch(
+            prefetch_targets(transformer_blocks[0])
+        )
 
     for transformer_block, next_transformer_block in zip(
         transformer_blocks, next_transformer_blocks
     ):
         if next_transformer_block is not None:
             # pyrefly: ignore [not-callable]
-            transformer_block.set_modules_to_forward_prefetch([next_transformer_block])
+            transformer_block.set_modules_to_forward_prefetch(
+                prefetch_targets(next_transformer_block)
+            )
         elif model.norm is not None and model.lm_head is not None:
             # pyrefly: ignore [not-callable]
             transformer_block.set_modules_to_forward_prefetch(
@@ -646,14 +710,18 @@ def apply_fsdp_to_decoder(
     prev_transformer_blocks = reversed_transformer_blocks[1:] + [None]
 
     if model.norm is not None and model.lm_head is not None and len(model.layers) > 0:
-        model.lm_head.set_modules_to_backward_prefetch([reversed_transformer_blocks[0]])
+        model.lm_head.set_modules_to_backward_prefetch(
+            prefetch_targets(transformer_blocks[-1], backward=True)
+        )
 
     for transformer_block, prev_transformer_block in zip(
         reversed_transformer_blocks, prev_transformer_blocks
     ):
         if prev_transformer_block is not None:
             # pyrefly: ignore [missing-attribute]
-            transformer_block.set_modules_to_backward_prefetch([prev_transformer_block])
+            transformer_block.set_modules_to_backward_prefetch(
+                prefetch_targets(prev_transformer_block, backward=True)
+            )
         elif model.tok_embeddings is not None:
             # pyrefly: ignore [missing-attribute]
             transformer_block.set_modules_to_backward_prefetch([model.tok_embeddings])
