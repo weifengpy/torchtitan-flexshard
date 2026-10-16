@@ -258,6 +258,7 @@ class MTPDecoder(Decoder):
                 reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
                 ep_degree=parallelism_context.ep,
                 edp_mesh=edp_mesh,
+                backward_experts_first=parallelism.flex_shard_backward_experts_first,
                 extra_blocks=[
                     (f"mtp_layers.{name}", layer)
                     for name, layer in self.mtp_layers.named_children()
