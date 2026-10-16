@@ -146,6 +146,19 @@ class BaseModel(Module, ABC):
         # Bind local implementations early; torch.compile traces on first use.
         apply_local_compile(local_compile_regions)
         with parallelism_context.activate_spmd():
+            if (
+                parallelism.flex_shard_blockwise_fp8
+                or parallelism.flex_shard_blockwise_fp8_dense_reference
+            ):
+                from torchtitan.distributed.flex_shard_blockwise_fp8 import (
+                    convert_blockwise_fp8_linears,
+                )
+
+                # Before _parallelize, so the FP8 linears get the sharding of
+                # the linears they replace.
+                convert_blockwise_fp8_linears(
+                    self, use_triton=parallelism.flex_shard_blockwise_fp8_use_triton
+                )
             self._parallelize(parallelism_context)
             if ac_config is not None:
                 ac_config.build(dump_folder=dump_folder).apply(self)
