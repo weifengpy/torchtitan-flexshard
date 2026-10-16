@@ -292,9 +292,13 @@ def set_dense_ffn_sharding(
         in_src_shardings={"x": attn_x_layout},
         out_src_shardings=attn_x_layout,
     )
-    feed_forward_cfg.w13.sharding_config = stacked_colwise_config(
-        input_layout=attn_x_layout
-    )
+    if feed_forward_cfg.w13 is None:
+        feed_forward_cfg.w1.sharding_config = colwise_config(input_layout=attn_x_layout)
+        feed_forward_cfg.w3.sharding_config = colwise_config(input_layout=attn_x_layout)
+    else:
+        feed_forward_cfg.w13.sharding_config = stacked_colwise_config(
+            input_layout=attn_x_layout
+        )
     feed_forward_cfg.w2.sharding_config = rowwise_config(output_layout=attn_x_layout)
 
 

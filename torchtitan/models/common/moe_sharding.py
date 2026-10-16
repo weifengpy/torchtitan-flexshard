@@ -12,6 +12,7 @@ from spmd_types import SpmdType
 from torchtitan.distributed.parallelism_context import MeshAxisName
 
 from torchtitan.models.common.decoder_sharding import (
+    colwise_config,
     dense_activation_placement,
     dense_param_placement,
     dense_sequence_parallel_placement,
@@ -267,7 +268,18 @@ def set_shared_moe_sharding_config(
         enable_sp=enable_sp
     )
     shared_experts_cfg.sharding_config = shared_config
-    shared_experts_cfg.w13.sharding_config = w13_config
+    if shared_experts_cfg.w13 is None:
+        # Split gate and up projections: each is an ordinary column-parallel
+        # linear.
+        input_layout = shared_config.in_src_shardings["x"]
+        shared_experts_cfg.w1.sharding_config = colwise_config(
+            input_layout=input_layout
+        )
+        shared_experts_cfg.w3.sharding_config = colwise_config(
+            input_layout=input_layout
+        )
+    else:
+        shared_experts_cfg.w13.sharding_config = w13_config
     shared_experts_cfg.w2.sharding_config = w2_config
 
 
