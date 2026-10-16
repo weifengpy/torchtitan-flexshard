@@ -184,6 +184,14 @@ class ParallelismConfig:
     buffers, so a block's reduce-scatter doesn't wait for its experts'.
     """
 
+    flex_shard_backward_experts_first: bool = False
+    """
+    With ``fsdp_backend="flex_shard"`` and expert parallelism: in backward,
+    gather a block's routed-expert bucket before the rest of the block, the
+    order in which FSDP2 issues a module's two parameter groups. By default the
+    rest of the block goes first. Forward is unchanged.
+    """
+
     tensor_parallel_degree: int = 1
     """Tensor Parallelism degree. 1 means disabled."""
 
@@ -406,6 +414,11 @@ class ParallelismConfig:
             raise ValueError(
                 "parallelism.fsdp2_nested_routed_experts requires "
                 f"parallelism.fsdp_backend='fsdp2' (got {self.fsdp_backend!r})"
+            )
+        if self.flex_shard_backward_experts_first and self.fsdp_backend != "flex_shard":
+            raise ValueError(
+                "parallelism.flex_shard_backward_experts_first requires "
+                f"parallelism.fsdp_backend='flex_shard' (got {self.fsdp_backend!r})"
             )
         if self.fsdp_backend == "flex_shard":
             unsupported = [
