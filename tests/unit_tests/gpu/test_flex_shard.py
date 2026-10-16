@@ -401,6 +401,12 @@ class TestFlexShardDecoder(DTensorTestBase):
         # equal FSDP2's bit for bit over 3 steps, with clipping off (grad norms
         # may round apart, as owners split the sum of squares differently), and
         # its DistMuon step runs no collectives, while FSDP2's redistributes.
+        # FSDP2's DistMuon takes FlexShard's layout (flex_shard_layout): each of
+        # those matrices computes on the rank FlexShard stores it on.
+        from torchtitan.components.checkpointer.utils import canonical_fqn
+        from torchtitan.distributed.flex_shard._optimizer_reshard_schedule import (
+            _RedistributionBucketPlan,
+        )
         from torchtitan_recipes.tests.models.dist_muon import (
             mla_dist_muon_optimizer,
             MLA_DIST_MUON_OWNED_PARAMS,
@@ -417,6 +423,7 @@ class TestFlexShardDecoder(DTensorTestBase):
             enable_sequence_parallel=False,
         )
         losses, collectives = {}, {}
+        owners: dict[str, dict[str, int]] = {"fsdp2": {}, "flex_shard": {}}
         for backend, owned in (
             ("fsdp2", ()),
             ("flex_shard", MLA_DIST_MUON_OWNED_PARAMS),
@@ -445,18 +452,45 @@ class TestFlexShardDecoder(DTensorTestBase):
                     block = ".".join(fqns[0].split(".")[:2])
                     buckets_per_block[block] = buckets_per_block.get(block, 0) + 1
                     for fqn in fqns:
-                        self.assertIsInstance(
-                            storage.param_infos[fqn].placement, BucketedOwned, fqn
-                        )
+                        placement = storage.param_infos[fqn].placement
+                        self.assertIsInstance(placement, BucketedOwned, fqn)
+                        (segment,) = placement.segments_by_fqn[fqn]
+                        owners[backend][canonical_fqn(fqn)] = segment.owner_rank
                 self.assertEqual(
                     set(buckets_per_block.values()), {1}, buckets_per_block
                 )
             optim = mla_dist_muon_optimizer(
-                model_config, muon_lr=8e-4, adamw_lr=8e-4, parallelism=parallelism
+                model_config,
+                muon_lr=8e-4,
+                adamw_lr=8e-4,
+                parallelism=parallelism,
+                flex_shard_layout=True,
             ).build(model_parts=[model])
             (dist_muon,) = [
                 o for o in optim.optimizers if "DistMuon" in type(o).__name__
             ]
+            if backend == "fsdp2":
+                for bucket in dist_muon._bucket_plans:
+                    if not isinstance(bucket, _RedistributionBucketPlan):
+                        continue
+                    ranks = bucket.group.mesh_axis_participants
+                    for item, plan in zip(
+                        bucket.redistributed_items,
+                        bucket.redistribution_plans,
+                        strict=True,
+                    ):
+                        (owner,) = [
+                            partition.participant
+                            for partition in plan.compute_partitions
+                            if partition.logical_regions
+                        ]
+                        owners[backend][item.fqn] = ranks.index(owner)
+                muon_fqns = {
+                    fqn
+                    for fqn in dist_muon.param_groups[0]["param_names"]
+                    if ".routed_experts." not in fqn
+                }
+                self.assertEqual(set(owners[backend]), muon_fqns)
             collectives[backend] = []
             step = dist_muon.step
 
@@ -482,6 +516,10 @@ class TestFlexShardDecoder(DTensorTestBase):
                 )
         self.assertEqual(collectives["flex_shard"], [0, 0, 0])
         self.assertTrue(all(collectives["fsdp2"]), collectives["fsdp2"])
+        self.assertEqual(
+            owners["fsdp2"],
+            {fqn: owners["flex_shard"][fqn] for fqn in owners["fsdp2"]},
+        )
 
     @with_comms
     def test_matches_fsdp2_with_cuda_graphs(self):
