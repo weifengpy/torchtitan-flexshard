@@ -78,6 +78,7 @@ def apply_flex_shard_to_decoder(
     reshard_after_forward_policy: str = "default",
     ep_degree: int = 1,
     edp_mesh: DeviceMesh | None = None,
+    backward_experts_first: bool = False,
     extra_blocks: Sequence[tuple[str, nn.Module]] = (),
     owned_param_patterns: Sequence[str] = (),
     blockwise_fp8: bool = False,
@@ -118,6 +119,10 @@ def apply_flex_shard_to_decoder(
         ep_degree: The expert-parallel degree.
         edp_mesh: With ``ep_degree > 1``, the sparse storage mesh, with the
             ``edp_shard`` and ``ep`` axes.
+        backward_experts_first: With ``ep_degree > 1``, whether a block's
+            backward prefetch gathers its expert bucket before the rest of the
+            block, as FSDP2 orders a module's parameter groups
+            (``parallelism.flex_shard_backward_experts_first``).
         extra_blocks: Transformer blocks outside ``model.layers``, by FQN, each
             sharded like a block after the last one, e.g. DeepSeek V3's MTP
             layers, which ``apply_fsdp_to_mtp_decoder`` appends to the layers.
@@ -379,6 +384,7 @@ def apply_flex_shard_to_decoder(
             block_buckets=block_buckets,
             head_bucket=head_bucket,
             expert_buckets=expert_buckets,
+            backward_experts_first=backward_experts_first,
         )
         # A MoE layer is two buckets, its routed experts and the rest. With one
         # pending reduce-grad, the dense bucket's reduce-scatter first waits for
@@ -450,6 +456,7 @@ def _set_explicit_prefetch(
     block_buckets: list[list[int]],
     head_bucket: int | None,
     expert_buckets: list[int],
+    backward_experts_first: bool = False,
 ) -> None:
     """Set the explicit prefetch ``apply_fsdp_to_decoder`` sets with expert
     parallelism, whose device-to-host syncs keep the CPU from issuing the next
@@ -461,10 +468,21 @@ def _set_explicit_prefetch(
     one, the first one the embedding. A block prefetches from its first bucket,
     which hooks the block, and prefetches all its buckets. Its expert bucket,
     whose group FSDP2 unshards with the block, prefetches nothing.
+
+    With ``backward_experts_first``, a block's backward prefetch lists its
+    expert bucket first, as FSDP2 orders a module's groups; forward keeps the
+    block's bucket order.
     """
+    experts = set(expert_buckets)
 
     def block(idx: int) -> list:
         return [storages[bucket] for bucket in block_buckets[idx]]
+
+    def block_backward(idx: int) -> list:
+        buckets = block_buckets[idx]
+        if backward_experts_first:
+            buckets = sorted(buckets, key=lambda bucket: bucket not in experts)
+        return [storages[bucket] for bucket in buckets]
 
     for bucket in expert_buckets:
         storages[bucket].set_buckets_to_forward_prefetch([])
@@ -472,7 +490,7 @@ def _set_explicit_prefetch(
     if embedding_bucket is not None and block_buckets:
         storages[embedding_bucket].set_buckets_to_forward_prefetch(block(0))
     if head_bucket is not None and block_buckets:
-        storages[head_bucket].set_buckets_to_backward_prefetch(block(-1))
+        storages[head_bucket].set_buckets_to_backward_prefetch(block_backward(-1))
     for idx, buckets in enumerate(block_buckets):
         first = storages[buckets[0]]
         if idx + 1 < len(block_buckets):
@@ -482,7 +500,7 @@ def _set_explicit_prefetch(
         else:
             first.set_buckets_to_forward_prefetch([])
         if idx > 0:
-            first.set_buckets_to_backward_prefetch(block(idx - 1))
+            first.set_buckets_to_backward_prefetch(block_backward(idx - 1))
         elif embedding_bucket is not None:
             first.set_buckets_to_backward_prefetch([storages[embedding_bucket]])
 
