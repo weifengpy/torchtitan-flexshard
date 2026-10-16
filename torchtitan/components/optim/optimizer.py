@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import re
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -16,14 +17,18 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.distributed.checkpoint.stateful import Stateful
+from torch.distributed.tensor import Replicate, Shard
 from torch.optim import Optimizer
 
 from torchtitan.components.checkpointer.utils import canonical_fqn
 from torchtitan.config import Configurable
+
 from torchtitan.distributed.flex_shard import (
+    BlockShard,
     BucketConfig,
     ComputeLayout,
     DistMuon as FlexShardDistMuon,
+    Owned,
 )
 
 from .utils import (
@@ -226,6 +231,127 @@ class DistMuon(FlexShardDistMuon, BaseOptimizer):
         )
 
 
+class _LocalDistMuon(DistMuon):
+    """DistMuon on DTensor proxies of one rank's FlexShard storage, on a
+    one-rank mesh (see ``_build_flex_shard_dist_muon``). The container drives
+    it as any optimizer, so its step first gives the proxies their parameters'
+    grads, and its ``zero_grad`` clears the parameters' grads too."""
+
+    # flex_shard.dist_muon.LocalDistMuonBinding, set once it's built.
+    binding: Any
+
+    @overload
+    def step(self, closure: None = None) -> None:
+        ...
+
+    @overload
+    def step(self, closure: Callable[[], float]) -> float:
+        ...
+
+    def step(self, closure: Callable[[], float] | None = None) -> float | None:
+        self.binding.copy_grads_to_proxies()
+        return super().step(closure)
+
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        super().zero_grad(set_to_none=set_to_none)
+        self.binding.zero_real_grads(set_to_none)
+
+
+def _local_compute_layout(compute_layout: ComputeLayout, axis: str) -> ComputeLayout:
+    """The compute layout on a one-rank mesh axis that gives DistMuon the matrix
+    views it gives the data-parallel layout: blocks for ``BlockShard``, the
+    whole local tensor otherwise."""
+    shardings = [
+        sharding
+        for sharding in compute_layout.shardings_by_mesh_axis.values()
+        if not isinstance(sharding, Replicate)
+    ]
+    blocks = [sharding for sharding in shardings if isinstance(sharding, BlockShard)]
+    if blocks:
+        sharding = blocks[0]
+    elif any(isinstance(sharding, Owned) for sharding in shardings):
+        sharding = Owned()
+    else:
+        sharding = Shard(0)
+    return ComputeLayout(shardings_by_mesh_axis={axis: sharding})
+
+
+def _build_flex_shard_dist_muon(
+    config: DistMuon.Config,
+    model: nn.Module,
+    param_group: dict[str, Any],
+) -> Optimizer:
+    """DistMuon over a FlexShard model's parameters, with no collectives in
+    its step.
+
+    Each Muon parameter must be stored where DistMuon computes it: whole on
+    an owner (``parallelism.flex_shard_owned_params``), or in row shards that
+    hold whole units, e.g. whole heads, gate or up matrices, or experts, which
+    DistMuon's own plan for FSDP2's layout shows (``_NoRedistributionTransition``).
+    torchtitan's DistMuon then runs on each rank's local storage on a one-rank
+    mesh, through FlexShard's ``build_local_dist_muon``: the same matrix views
+    and batches per parameter as on the data-parallel mesh, so the same update.
+    A whole matrix computed alone gives the same result on any owner.
+    """
+    # pyrefly: ignore [missing-import]
+    from flex_shard import get_placements
+
+    # pyrefly: ignore [missing-import]
+    from flex_shard.custom_placements.owned import BucketedOwned
+
+    # pyrefly: ignore [missing-import]
+    from flex_shard.dist_muon import build_local_dist_muon
+
+    from torchtitan.distributed.flex_shard.dist_muon import (
+        _NoRedistributionTransition,
+        _resolve_storage_to_compute_transition,
+    )
+    from torchtitan.distributed.flex_shard_fsdp import as_fsdp2_dtensor
+
+    named_params = list(
+        zip(param_group["param_names"], param_group["params"], strict=True)
+    )
+    for fqn, param in named_params:
+        (placement,) = get_placements(param)
+        if isinstance(placement, BucketedOwned):
+            continue
+        transition = _resolve_storage_to_compute_transition(
+            fqn, as_fsdp2_dtensor(param), config.compute_sharding_by_fqn[fqn]
+        ).storage_to_compute_transition
+        if not isinstance(transition, _NoRedistributionTransition):
+            raise ValueError(
+                f"DistMuon with FlexShard computes each parameter where it is "
+                f"stored, but {fqn!r}'s row shards split its compute units over "
+                "ranks; list it in parallelism.flex_shard_owned_params, or use a "
+                "data-parallel degree that keeps its units whole."
+            )
+
+    def optimizer_factory(
+        param_groups: list[dict[str, Any]], _layouts: Mapping[str, Any]
+    ) -> Optimizer:
+        (group,) = param_groups
+        (axis,) = group["params"][0].device_mesh.mesh_dim_names
+        local_config = dataclasses.replace(
+            config,
+            compute_sharding_by_fqn={
+                fqn: _local_compute_layout(config.compute_sharding_by_fqn[fqn], axis)
+                for fqn in group["param_names"]
+            },
+        )
+        return _LocalDistMuon(local_config, params=param_groups)
+
+    binding = build_local_dist_muon(
+        model, named_params, optimizer_factory=optimizer_factory
+    )
+    if binding is None:
+        raise ValueError(
+            "DistMuon with FlexShard found no local Muon parameters on this rank."
+        )
+    optimizer = cast(_LocalDistMuon, binding.optimizer)
+    optimizer.binding = binding
+    return optimizer
+
+
 class OptimizersContainer(Optimizer, Stateful, Configurable):
     """A container for multiple optimizers, supporting mixed optimizer types.
 
@@ -303,7 +429,14 @@ class OptimizersContainer(Optimizer, Stateful, Configurable):
                     optimizer_config,
                     claimed,
                 )
-                optimizer = optimizer_config.build(params=[param_group])
+                # FlexShard's root module finds the bucket of a parameter.
+                flex_shard_model = hasattr(model, "bucket_storage_of")
+                if flex_shard_model and isinstance(optimizer_config, DistMuon.Config):
+                    optimizer = _build_flex_shard_dist_muon(
+                        optimizer_config, model, param_group
+                    )
+                else:
+                    optimizer = optimizer_config.build(params=[param_group])
                 if enable_cuda_graph:
                     if any(
                         "capturable" not in group for group in optimizer.param_groups
@@ -330,8 +463,7 @@ class OptimizersContainer(Optimizer, Stateful, Configurable):
                         return state_dict
 
                     optimizer.register_state_dict_post_hook(_save_host_lr)
-                # FlexShard's root module finds the bucket of a parameter.
-                if hasattr(model, "bucket_storage_of"):
+                if flex_shard_model and not isinstance(optimizer, _LocalDistMuon):
                     # Make optimizer.state_dict() declare where each state
                     # tensor's local shard sits, as DCP needs for FlexShard.
                     # pyrefly: ignore [missing-import]
