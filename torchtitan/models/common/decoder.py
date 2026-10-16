@@ -178,6 +178,9 @@ class Decoder(BaseModel):
                 blockwise_fp8_dense_reference=(
                     parallelism.flex_shard_blockwise_fp8_dense_reference
                 ),
+                separate_reduce_scatter_group=(
+                    parallelism.fsdp_separate_reduce_scatter_group
+                ),
             )
             return
         apply_fsdp_to_decoder(
@@ -193,6 +196,9 @@ class Decoder(BaseModel):
             dp_mesh_dims=dp_mesh_dims,
             edp_mesh_dims=edp_mesh_dims,
             symm_mem_scope=parallelism.fsdp_symm_mem_scope,
+            separate_reduce_scatter_group=(
+                parallelism.fsdp_separate_reduce_scatter_group
+            ),
         )
 
     def __init__(self, config: Config):
