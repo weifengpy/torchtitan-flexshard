@@ -20,7 +20,7 @@ import logging
 import re
 import sys
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from typing import cast, TYPE_CHECKING
+from typing import Any, cast, TYPE_CHECKING
 
 import spmd_types as spmd
 import torch
@@ -47,7 +47,9 @@ if TYPE_CHECKING:
 
 __all__ = [
     "apply_flex_shard_to_decoder",
+    "as_flex_shard_state_dict",
     "as_fsdp2_dtensor",
+    "as_fsdp2_state_dict",
     "enable_pipelining",
     "flex_shard_owner_map",
     "fsdp2_dtensor_params",
@@ -457,6 +459,53 @@ def fsdp2_dtensor_params(module: nn.Module) -> Iterator[None]:
     finally:
         for name, param in swapped.items():
             module._parameters[name] = param
+
+
+def as_fsdp2_state_dict(
+    model_parts: Iterable[nn.Module], state_dict: dict[str, Any]
+) -> dict[str, Any]:
+    """Return ``state_dict`` with its FlexShard parameters as the DTensors FSDP2
+    would give them, for code written for FSDP2's state dicts, e.g. the Hugging
+    Face conversions of state dict adapters.
+
+    The DTensors view the state dict's tensors, so in-place updates such as
+    ``dcp.load`` reach them. Other entries are unchanged.
+    """
+    converted = dict(state_dict)
+    for key, param in _flex_shard_params(model_parts, state_dict):
+        converted[key] = _as_fsdp2_dtensor(state_dict[key], param)
+    return converted
+
+
+def as_flex_shard_state_dict(
+    model_parts: Iterable[nn.Module], state_dict: dict[str, Any]
+) -> dict[str, Any]:
+    """Return ``state_dict`` with its FlexShard parameters' DTensors as the
+    parameters' local shards, inverting ``as_fsdp2_state_dict`` for
+    ``load_state_dict``."""
+    converted = dict(state_dict)
+    for key, param in _flex_shard_params(model_parts, state_dict):
+        value = state_dict[key]
+        assert isinstance(value, DTensor), f"expected a DTensor for {key}"
+        view = cast(DTensor, _as_fsdp2_dtensor(param.detach(), param))
+        value = value.redistribute(view.device_mesh, view.placements)
+        converted[key] = value.to_local()
+    return converted
+
+
+def _flex_shard_params(
+    model_parts: Iterable[nn.Module], state_dict: dict[str, Any]
+) -> Iterator[tuple[str, nn.Parameter]]:
+    """Yield the FlexShard parameters of ``model_parts`` with their keys in
+    ``state_dict``."""
+    flex_shard = sys.modules.get("flex_shard")
+    if flex_shard is None:
+        return
+    for model in model_parts:
+        for fqn, param in model.named_parameters():
+            key = canonical_fqn(fqn)
+            if key in state_dict and flex_shard.is_flex_shard_param(param):
+                yield key, param
 
 
 class _FSDPModuleOrFlexShardMeta(type):

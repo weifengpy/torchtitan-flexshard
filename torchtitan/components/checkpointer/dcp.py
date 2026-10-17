@@ -392,7 +392,17 @@ class CheckpointManager(BaseCheckpointManager):
                 "but sd_adapter is not provided."
             )
 
-            hf_state_dict = self.sd_adapter.to_hf(state_dict)
+            # The adapter converts FSDP2's DTensor parameters. FlexShard's are
+            # plain local shards, so it gets them as those DTensors.
+            from torchtitan.distributed.flex_shard_fsdp import (
+                as_flex_shard_state_dict,
+                as_fsdp2_state_dict,
+            )
+
+            model_parts = states[MODEL].model
+            hf_state_dict = self.sd_adapter.to_hf(
+                as_fsdp2_state_dict(model_parts, state_dict)
+            )
             hf_storage_reader = self.sd_adapter.get_hf_storage_reader(
                 checkpoint_id, from_quantized
             )
@@ -400,7 +410,9 @@ class CheckpointManager(BaseCheckpointManager):
             dcp.load(hf_state_dict, storage_reader=hf_storage_reader)
 
             state_dict = self.sd_adapter.from_hf(hf_state_dict)
-            states[MODEL].load_state_dict(state_dict)
+            states[MODEL].load_state_dict(
+                as_flex_shard_state_dict(model_parts, state_dict)
+            )
         else:
             dcp.load(state_dict, checkpoint_id=checkpoint_id)
 
