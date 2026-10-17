@@ -72,6 +72,10 @@ def _local(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.to_local() if isinstance(tensor, DTensor) else tensor
 
 
+def _box(offset: tuple[int, ...], size: tuple[int, ...]) -> tuple[slice, ...]:
+    return tuple(slice(o, o + n) for o, n in zip(offset, size, strict=True))
+
+
 class TestFlexShardDecoder(DTensorTestBase):
     @property
     def world_size(self) -> int:
@@ -85,6 +89,7 @@ class TestFlexShardDecoder(DTensorTestBase):
         parallelism_context: ParallelismContext,
         build_config=build_model_config,
         owned_params: tuple[str, ...] = (),
+        **parallelism_options,
     ):
         parallelism = ParallelismConfig(
             data_parallel_shard_degree=parallelism_context.dp_shard,
@@ -95,6 +100,7 @@ class TestFlexShardDecoder(DTensorTestBase):
             fsdp_backend=fsdp_backend,
             fsdp_reshard_after_forward=reshard_after_forward,
             flex_shard_owned_params=list(owned_params),
+            **parallelism_options,
         )
         model_config = build_config("debugmodel", seq_len=_seq_len(parallelism_context))
         if parallelism_context.cp > 1:
@@ -744,10 +750,11 @@ class TestFlexShardDecoder(DTensorTestBase):
                 f"{context}, saved after the resume",
             )
 
-    def _check_hf_load_matches_fsdp2(self, parallelism_context) -> None:
-        build_config = build_deepseek_v3_model_config
+    def _export_fsdp2_hf(self, parallelism_context) -> tuple[Any, str]:
+        """Train a DeepSeek V3 model with FSDP2 for a step and export its
+        weights in HF format; return the model and the export's path."""
         model, model_config, *setup = self._build(
-            "fsdp2", "default", parallelism_context, build_config
+            "fsdp2", "default", parallelism_context, build_deepseek_v3_model_config
         )
         optimizers = self._optimizers(model)
         # A step makes the weights differ from the initialization the loading
@@ -755,7 +762,6 @@ class TestFlexShardDecoder(DTensorTestBase):
         self._train(
             model, model_config, *setup, 1, False, optim=optimizers, steps=range(1)
         )
-        expected = self._local_params(model)
         export_folder = os.path.join(self.temp_dir, "export")
         checkpointer = self._checkpointer(
             model,
@@ -768,23 +774,40 @@ class TestFlexShardDecoder(DTensorTestBase):
         )
         checkpointer.save(1, last_step=True)
         checkpointer.close()
+        return model, os.path.join(export_folder, "step-1")
 
+    def _load_hf(
+        self, backend: str, parallelism_context, path: str, **parallelism_options
+    ):
+        """Build a DeepSeek V3 model and load its weights from the HF export at
+        ``path``; return the model and its config."""
+        model, model_config, *_ = self._build(
+            backend,
+            "default",
+            parallelism_context,
+            build_deepseek_v3_model_config,
+            **parallelism_options,
+        )
+        checkpointer = self._checkpointer(
+            model,
+            self._optimizers(model),
+            os.path.join(self.temp_dir, "_".join([backend, *parallelism_options])),
+            sd_adapter=DeepSeekV3StateDictAdapter(model_config, None),
+            initial_load_path=path,
+            initial_load_in_hf=True,
+        )
+        self.assertTrue(checkpointer.load())
+        checkpointer.close()
+        return model, model_config
+
+    def _check_hf_load_matches_fsdp2(self, parallelism_context) -> None:
+        model, path = self._export_fsdp2_hf(parallelism_context)
+        expected = self._local_params(model)
         models = {}
         for backend in ("fsdp2", "flex_shard"):
-            model, model_config, *_ = self._build(
-                backend, "default", parallelism_context, build_config
+            models[backend], model_config = self._load_hf(
+                backend, parallelism_context, path
             )
-            checkpointer = self._checkpointer(
-                model,
-                self._optimizers(model),
-                os.path.join(self.temp_dir, backend),
-                sd_adapter=DeepSeekV3StateDictAdapter(model_config, None),
-                initial_load_path=os.path.join(export_folder, "step-1"),
-                initial_load_in_hf=True,
-            )
-            self.assertTrue(checkpointer.load())
-            checkpointer.close()
-            models[backend] = model
         # FlexShard's parameters reach the adapter as views of the chunks
         # FlexShard declares to DCP, and from_hf returns them with the views'
         # placements, so the load redistributes nothing.
@@ -943,6 +966,57 @@ class TestFlexShardDecoder(DTensorTestBase):
     def test_hf_load_matches_fsdp2_with_one_rank_edp_shard(self):
         # ep spans all ranks, so the routed experts' edp_shard axis has one rank.
         self._check_hf_load_matches_fsdp2(self._context(ep=4))
+
+    @with_comms
+    @with_temp_dir
+    def test_hf_load_matches_fsdp2_with_blockwise_fp8(self):
+        # A blockwise FP8 weight's local shard is a range of its matrix's rows,
+        # in whole 128-row blocks, not FSDP2's chunk. Each rank's rows must hold
+        # the same values as those rows of FSDP2's full weight; the other
+        # parameters keep FSDP2's chunks. ep spans all ranks, as in the 256-GPU
+        # job.
+        from torchtitan.distributed.flex_shard_blockwise_fp8 import (
+            blockwise_fp8_weights,
+        )
+
+        parallelism_context = self._context(ep=4)
+        fsdp2, path = self._export_fsdp2_hf(parallelism_context)
+        expected = self._local_params(fsdp2)
+        full = {
+            fqn: cast(DTensor, param).full_tensor()
+            for fqn, param in fsdp2.named_parameters()
+        }
+        for option in (
+            "flex_shard_blockwise_fp8",
+            "flex_shard_blockwise_fp8_dense_reference",
+        ):
+            flex, _ = self._load_hf(
+                "flex_shard", parallelism_context, path, **{option: True}
+            )
+            fp8_weights = blockwise_fp8_weights(flex)
+            self.assertTrue(fp8_weights, msg=option)
+            layouts = flex_shard.get_flex_shard_global_layouts(flex)
+            for fqn, param in flex.named_parameters():
+                local = _local(param).detach()
+                if param not in fp8_weights:
+                    self.assertTrue(
+                        torch.equal(local, expected[fqn]), msg=f"{option} {fqn}"
+                    )
+                    continue
+                layout = layouts[fqn]
+                for global_offset, local_offset, size in zip(
+                    layout.global_offsets,
+                    layout.local_offsets,
+                    layout.local_sizes,
+                    strict=True,
+                ):
+                    self.assertTrue(
+                        torch.equal(
+                            local[_box(local_offset, size)],
+                            full[fqn][_box(global_offset, size)],
+                        ),
+                        msg=f"{option} {fqn} rows at {global_offset}",
+                    )
 
 
 def _chunks(metadata: TensorStorageMetadata) -> list[tuple[tuple[int, ...], ...]]:
