@@ -115,6 +115,10 @@ class DistMoeRoutedExperts(Module):
         """Return W13 and W2 operands for the annex invocation."""
         w13_E2FD = self.w13.weight
         w2_EDF = self.w2.weight
+        if self.w13.rows_on_dim0 or self.w2.rows_on_dim0:
+            # Weights stored 2-D: Dist-MoE takes their grouped views, whose
+            # in-place gradient writes land in the 2-D parameters' grads.
+            return self.w13.grouped_view(w13_E2FD), self.w2.grouped_view(w2_EDF)
         w13_EFD = w13_E2FD.flatten(1, 2)
         return w13_EFD, w2_EDF
 

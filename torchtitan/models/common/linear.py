@@ -354,6 +354,11 @@ class GroupedLinear(Module):
         self.num_linears = config.num_linears
         self.rows_on_dim0 = config.rows_on_dim0
         self.init_seed = config.init_seed
+        # With rows_on_dim0, the index of this weight's first group among the
+        # groups that draw from ``init_seed``, e.g. this expert-parallel rank's
+        # first expert, so that every group draws the block it would draw with
+        # all groups in one weight.
+        self.group_offset = 0
         output_shape = self._output_shape
         self.weight = nn.Parameter(
             torch.empty(config.group_size * math.prod(output_shape), config.in_features)
@@ -420,7 +425,7 @@ class GroupedLinear(Module):
                     device=local.device,
                 )
                 with torch.random.fork_rng(devices=devices):
-                    torch.manual_seed((seed + group) % 2**62)
+                    torch.manual_seed((seed + self.group_offset + group) % 2**62)
                     init(block)
                 start = max(first_row, group * rows_per_group)
                 end = min(end_row, (group + 1) * rows_per_group)
@@ -430,6 +435,13 @@ class GroupedLinear(Module):
                         start - block_start : end - block_start
                     ]
                 )
+
+    def grouped_view(self, weight: torch.Tensor) -> torch.Tensor:
+        """Return ``weight``, this module's weight or a tensor of its layout, as
+        ``[E, num_linears * out, in]``, a view in both layouts."""
+        if self.rows_on_dim0:
+            return weight.view(-1, math.prod(self._output_shape), self.in_features)
+        return weight.flatten(1, -2)
 
     def forward(self, input_RI: torch.Tensor, offsets_E: torch.Tensor) -> torch.Tensor:
         """Apply each grouped linear to rows selected by cumulative offsets.
@@ -443,11 +455,7 @@ class GroupedLinear(Module):
             feature axis.
         """
         output_shape = self._output_shape
-        weight_EOI = (
-            self.weight.view(-1, math.prod(output_shape), self.in_features)
-            if self.rows_on_dim0
-            else self.weight.flatten(1, -2)
-        )
+        weight_EOI = self.grouped_view(self.weight)
         output_RO = remat.region(
             self._grouped_mm,
             self.remat_region_name("grouped_mm"),
