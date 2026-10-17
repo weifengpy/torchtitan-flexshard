@@ -12,6 +12,7 @@ import os
 import pickle
 import time
 from dataclasses import dataclass
+from typing import Any, Literal
 
 import torch
 
@@ -28,6 +29,10 @@ logger = logging.getLogger(__name__)
 
 _EXPORT_SUPPORTS_ANNOTATIONS = (
     "cuda_graph_annotations"
+    in inspect.signature(torch.profiler.profile.export_chrome_trace).parameters
+)
+_EXPORT_SUPPORTS_GRAPH_LANES = (
+    "graph_lanes"
     in inspect.signature(torch.profiler.profile.export_chrome_trace).parameters
 )
 
@@ -187,6 +192,20 @@ class Profiler(Configurable):
         save_memory_snapshot_folder: str = MEMORY_DIR
         """Memory snapshot files location."""
 
+        cuda_graph_kernel_names: bool = False
+        """Name the kernels captured in CUDA graphs by microbatch and decoder layer
+        (``torch.cuda.graph_annotations.mark_kernels``, backward and recompute
+        kernels included), so traces of graph replays show where each kernel
+        belongs. Needs cuda-bindings >= 13.1 and a CUDA >= 13.1 user-mode driver
+        (or cuda-compat); without them it logs a warning and does nothing."""
+
+        cuda_graph_lanes: Literal["none", "all"] = "none"
+        """``graph_lanes`` for ``export_chrome_trace`` when the trace has CUDA graph
+        kernel annotations. ``"all"`` moves each replayed kernel off the hardware
+        stream the graph executor picked (thousands per step for a whole-step
+        graph) onto the lane its annotation names, or stream 7, keeping the
+        hardware stream in ``args["original_stream"]``."""
+
         memory_snapshot_max_entries: int = 1_000_000
         """Max alloc/free events recorded per memory snapshot (ring buffer).
 
@@ -195,6 +214,11 @@ class Profiler(Configurable):
         """
 
         def __post_init__(self) -> None:
+            if self.cuda_graph_lanes not in ("none", "all"):
+                raise ValueError(
+                    "profiler.cuda_graph_lanes must be 'none' or 'all', got "
+                    f"{self.cuda_graph_lanes!r}."
+                )
             if self.enable_profiling and self.profile_freq < (
                 self.profiler_warmup + self.profiler_active
             ):
@@ -333,7 +357,18 @@ class Profiler(Configurable):
                     "annotations."
                 )
                 annotations = None
-            extra = {"cuda_graph_annotations": annotations} if annotations else {}
+            extra: dict[str, Any] = (
+                {"cuda_graph_annotations": annotations} if annotations else {}
+            )
+            if cfg.cuda_graph_lanes != "none":
+                if not annotations or not _EXPORT_SUPPORTS_GRAPH_LANES:
+                    logger.warning(
+                        "profiler.cuda_graph_lanes needs CUDA graph kernel annotations "
+                        "and a torch whose export_chrome_trace takes graph_lanes; the "
+                        "trace keeps the hardware streams."
+                    )
+                else:
+                    extra["graph_lanes"] = cfg.cuda_graph_lanes
             prof.export_chrome_trace(output_file, **extra)
 
             logger.info(
