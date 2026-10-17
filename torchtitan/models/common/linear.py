@@ -14,6 +14,7 @@
 """
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import spmd_types as spmd
@@ -309,7 +310,8 @@ class GroupedLinear(Module):
     Like :class:`Linear`, ``num_linears`` retains a projection axis in parameter
     storage. For example, a fused gate/up projection stores ``[E, 2, F, D]``
     and returns ``[R, 2, F]`` while grouped GEMM consumes its zero-copy
-    ``[E, 2F, D]`` view.
+    ``[E, 2F, D]`` view. With ``rows_on_dim0``, it stores the same rows as a
+    2-D ``[E * 2F, D]`` weight instead.
 
     The grouped matmul is the remat region ``<fqn>.grouped_mm``, so every
     subclass, including quantized and LoRA ones that override ``_grouped_mm``,
@@ -327,12 +329,22 @@ class GroupedLinear(Module):
             num_linears: Number of stacked linears per element in the group.
                 Values greater than one retain a projection axis before
                 ``out_features``.
+            rows_on_dim0: Store the weight 2-D, every group's output rows
+                stacked on dimension 0, so FSDP shards it on dimension 0, the
+                only dimension FSDP2 lets it shard unevenly, e.g. 4 experts
+                over 6 ranks. Forward views it as ``[E, num_linears * out, in]``.
+            init_seed: With ``rows_on_dim0``, part of the seed each group's
+                block is drawn from (see ``_init_param``), so that grouped
+                linears draw differently. ``split_gate_up_and_store_experts_2d``
+                gives each its own.
         """
 
         group_size: int
         in_features: int
         out_features: int
         num_linears: int = 1
+        rows_on_dim0: bool = False
+        init_seed: int = 0
 
     def __init__(self, config: Config):
         super().__init__()
@@ -340,14 +352,84 @@ class GroupedLinear(Module):
         self.in_features = config.in_features
         self.out_features = config.out_features
         self.num_linears = config.num_linears
-        output_shape = (
-            (config.out_features,)
-            if config.num_linears == 1
-            else (config.num_linears, config.out_features)
-        )
+        self.rows_on_dim0 = config.rows_on_dim0
+        self.init_seed = config.init_seed
+        output_shape = self._output_shape
         self.weight = nn.Parameter(
-            torch.empty(config.group_size, *output_shape, config.in_features)
+            torch.empty(config.group_size * math.prod(output_shape), config.in_features)
+            if config.rows_on_dim0
+            else torch.empty(config.group_size, *output_shape, config.in_features)
         )
+
+    @property
+    def _output_shape(self) -> tuple[int, ...]:
+        if self.num_linears == 1:
+            return (self.out_features,)
+        return (self.num_linears, self.out_features)
+
+    def _init_param(self, name: str, param: nn.Parameter) -> None:
+        """With ``rows_on_dim0``, initialize each group's ``[*output, in]``
+        block through the ``[1, *output, in]`` view the initializers expect.
+
+        A shard is a run of rows that may start or end inside a block, so each
+        block a rank holds rows of is drawn on its own from a seed of its own,
+        and the rank keeps its rows. The values don't depend on the sharding,
+        and FSDP2 and FlexShard draw the same ones.
+        """
+        if not self.rows_on_dim0 or name not in (self._param_init or {}):
+            super()._init_param(name, param)
+            return
+        from torch.distributed.tensor import DTensor
+        from torch.distributed.tensor._utils import (
+            compute_local_shape_and_global_offset,
+        )
+
+        from torchtitan.distributed.flex_shard_fsdp import as_fsdp2_dtensor
+
+        init = self._param_init[name]
+        weight = as_fsdp2_dtensor(param)
+        if isinstance(weight, DTensor):
+            local = weight.to_local()
+            _, global_offset = compute_local_shape_and_global_offset(
+                weight.shape, weight.device_mesh, weight.placements
+            )
+            first_row = global_offset[0]
+        else:
+            local, first_row = weight, 0
+        self._init_rows(local, first_row, init)
+
+    def _init_rows(self, local: torch.Tensor, first_row: int, init: Callable) -> None:
+        """Initialize ``local``, the rows of the 2-D weight from ``first_row``
+        on (see ``_init_param``)."""
+        if local.numel() == 0:
+            return
+        rows_per_group = math.prod(self._output_shape)
+        end_row = first_row + local.shape[0]
+        # The training seed, which every rank of a model replica shares.
+        seed = torch.initial_seed() * 1_000_003 + self.init_seed * 4_099
+        devices = [local.device.index] if local.device.type == "cuda" else []
+        with torch.no_grad():
+            for group in range(
+                first_row // rows_per_group, (end_row - 1) // rows_per_group + 1
+            ):
+                block = torch.empty(
+                    1,
+                    *self._output_shape,
+                    self.in_features,
+                    dtype=local.dtype,
+                    device=local.device,
+                )
+                with torch.random.fork_rng(devices=devices):
+                    torch.manual_seed((seed + group) % 2**62)
+                    init(block)
+                start = max(first_row, group * rows_per_group)
+                end = min(end_row, (group + 1) * rows_per_group)
+                block_start = group * rows_per_group
+                local[start - first_row : end - first_row].copy_(
+                    block.view(rows_per_group, self.in_features)[
+                        start - block_start : end - block_start
+                    ]
+                )
 
     def forward(self, input_RI: torch.Tensor, offsets_E: torch.Tensor) -> torch.Tensor:
         """Apply each grouped linear to rows selected by cumulative offsets.
@@ -360,8 +442,12 @@ class GroupedLinear(Module):
             Output rows with an optional ``num_linears`` axis before the output
             feature axis.
         """
-        output_shape = self.weight.shape[1:-1]
-        weight_EOI = self.weight.flatten(1, -2)
+        output_shape = self._output_shape
+        weight_EOI = (
+            self.weight.view(-1, math.prod(output_shape), self.in_features)
+            if self.rows_on_dim0
+            else self.weight.flatten(1, -2)
+        )
         output_RO = remat.region(
             self._grouped_mm,
             self.remat_region_name("grouped_mm"),
