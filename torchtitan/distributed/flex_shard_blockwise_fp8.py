@@ -23,7 +23,8 @@ import fnmatch
 
 import torch
 import torch.nn as nn
-from torch.distributed.tensor import DTensor, Replicate
+import torch.distributed.tensor as dtensor
+from torch.distributed.tensor import Replicate, Shard
 
 # pyrefly: ignore [missing-import]
 from flex_shard import (
@@ -89,18 +90,23 @@ class FlexShardBlockwiseFp8Linear(FlexShardFloat8BlockwiseLinear, Module):
             super()._init_param(name, param)
             return
         # The FP8 placement's local shards are row ranges, which no DTensor
-        # placement describes. Initialize the full parameter as a replicated
-        # DTensor, which draws what FSDP2's shards of it draw, and keep this
-        # rank's regions.
+        # placement describes. Initialize the parameter as a DTensor sharded the
+        # way FSDP2 shards it (Shard(0), or Shard(1) for a stacked [N, F, D]
+        # weight, linear_param_shard_placements), so it draws what FSDP2's
+        # shards draw, then gather it and keep this rank's regions. A replicated
+        # DTensor draws the same values only for Shard(0): DTensor's random
+        # initialization of a Shard(1) tensor isn't the replicated tensor sliced.
         mesh = get_mesh(param)
-        full = DTensor.from_local(
-            param.new_empty(layout.global_shape),
-            mesh,
-            [Replicate()] * mesh.ndim,
-            run_check=False,
+        ndim = len(layout.global_shape)
+        shard_dim = ndim - 2 if ndim > 2 else 0
+        sharded = dtensor.empty(
+            layout.global_shape,
+            dtype=param.dtype,
+            device_mesh=mesh,
+            placements=[Replicate()] * (mesh.ndim - 1) + [Shard(shard_dim)],
         )
-        self._param_init[name](full)
-        full_local = full.to_local()
+        self._param_init[name](sharded)
+        full_local = sharded.full_tensor()
         with torch.no_grad():
             for global_offset, local_offset, size in zip(
                 layout.global_offsets,
