@@ -6,6 +6,8 @@
 
 """Lightweight CUDA graph wrapper for training steps."""
 
+import contextlib
+import functools
 import logging
 import warnings
 from collections.abc import Callable, Iterable, Sequence
@@ -220,6 +222,8 @@ class _CUDAGraphManager:
         self._stream: torch.cuda.Stream | None = None
         self._dummy_graph: torch.cuda.CUDAGraph | None = None
         self.all_annotations: dict[int, list[Any]] = {}
+        # Whether name_cuda_graph_kernels turned kernel naming on.
+        self.kernel_names = False
 
     @property
     def graph_pool(self) -> Any:
@@ -278,6 +282,65 @@ def cuda_graph_teardown() -> None:
 def get_cuda_graph_annotations() -> dict[int, list[Any]]:
     """Return all kernel annotations accumulated across CUDA graph captures."""
     return _manager.all_annotations
+
+
+def name_cuda_graph_kernels(model_parts: Sequence[torch.nn.Module]) -> bool:
+    """Name the kernels CUDA graph capture records, for traces of graph replays.
+
+    A replay runs its kernels on whatever hardware streams the graph executor
+    picks, so a trace can no longer tell which part of the step a kernel came
+    from. This brackets every decoder layer (each child of a model part's
+    ``layers``) in a ``torch.cuda.graph_annotations.mark_kernels`` scope named
+    after it, which also tags the layer's backward and recompute kernels, and
+    enables :func:`cuda_graph_kernel_scope` for the microbatch loop. The
+    profiler bakes the names into its traces.
+
+    Returns whether naming is on. Recording needs ``cuda-bindings`` >= 13.1 and
+    a CUDA >= 13.1 user-mode driver; without them nothing is installed and a
+    warning is logged.
+    """
+    from torch.cuda import graph_annotations
+
+    if not graph_annotations.is_available():
+        logger.warning(
+            "CUDA graph kernel names need cuda-bindings >= 13.1 and a CUDA >= 13.1 "
+            "user-mode driver (or cuda-compat); the trace keeps unnamed kernels."
+        )
+        return False
+
+    def enter_layer(module: torch.nn.Module, args: Any, *, name: str) -> None:
+        scope = graph_annotations.mark_kernels({"name": f"layer {name}", "layer": name})
+        scope.__enter__()
+        module.__dict__.setdefault("_cuda_graph_kernel_scopes", []).append(scope)
+
+    def exit_layer(module: torch.nn.Module, args: Any, output: Any) -> None:
+        module.__dict__["_cuda_graph_kernel_scopes"].pop().__exit__(None, None, None)
+
+    for model_part in model_parts:
+        layers = getattr(model_part, "layers", None)
+        if layers is None:
+            continue
+        for name, layer in layers.named_children():
+            # Prepended so the layer's FSDP pre-forward work (gather wait, copy-out,
+            # next-layer prefetch) counts as the layer's.
+            layer.register_forward_pre_hook(
+                functools.partial(enter_layer, name=name), prepend=True
+            )
+            layer.register_forward_hook(exit_layer, always_call=True)
+    _manager.kernel_names = True
+    return True
+
+
+def cuda_graph_kernel_scope(
+    annotation: dict[str, Any],
+) -> contextlib.AbstractContextManager[None]:
+    """Name the kernels captured inside this scope (see :func:`name_cuda_graph_kernels`);
+    a no-op unless naming is on. Inner scopes win on shared keys."""
+    if not _manager.kernel_names:
+        return contextlib.nullcontext()
+    from torch.cuda import graph_annotations
+
+    return graph_annotations.mark_kernels(annotation)
 
 
 def run_eager_on_cuda_graph_stream(
