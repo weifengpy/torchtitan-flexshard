@@ -199,6 +199,7 @@ class Decoder(BaseModel):
             separate_reduce_scatter_group=(
                 parallelism.fsdp_separate_reduce_scatter_group
             ),
+            native_collective_copy=parallelism.fsdp2_native_collective_copy,
         )
 
     def __init__(self, config: Config):
