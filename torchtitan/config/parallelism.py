@@ -63,6 +63,17 @@ class ParallelismConfig:
     fsdp_defer_gradient_reduction: bool = False
     """Defer FSDP gradient reduction until the last accumulation step."""
 
+    fsdp_separate_reduce_scatter_group: bool = False
+    """
+    Run gradient reduce-scatters on a process group of their own, with either
+    ``fsdp_backend``. By default all-gathers and reduce-scatters share the
+    sharding process group: one NCCL communicator, which runs one collective at
+    a time, so a backward all-gather queues behind the reduce-scatter issued
+    before it. With this, the two can progress together. FSDP2 applies
+    ``FSDPModule.set_separate_reduce_scatter_group``, FlexShard
+    ``FlexShardModule.set_separate_reduce_scatter_group`` (both experimental).
+    """
+
     fsdp_symm_mem_scope: FSDPSymmMemScope = None
     """
     Which FSDP modules use symmetric-memory communication. None disables it.
