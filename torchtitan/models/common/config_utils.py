@@ -48,14 +48,87 @@ from torchtitan.protocols.module import Module
 DEFAULT_DEBUG_MODEL_SEQ_LEN = 2048
 
 
+@dataclasses.dataclass(frozen=True)
+class _FusedGateUpInit:
+    """Initializer for a stacked gate/up linear weight, keeping its parts so
+    ``split_gate_up_and_store_experts_2d`` can give them to split linears."""
+
+    gate_init: Callable
+    up_init: Callable
+
+    def __call__(self, t: torch.Tensor) -> None:
+        self.gate_init(t[0])
+        self.up_init(t[1])
+
+
 def _make_fused_linear_init(gate_init: Callable, up_init: Callable) -> Callable:
     """Build an initializer for a stacked gate/up linear weight."""
+    return _FusedGateUpInit(gate_init, up_init)
 
-    def _init(t: torch.Tensor) -> None:
-        gate_init(t[0])
-        up_init(t[1])
 
-    return _init
+def split_gate_up_and_store_experts_2d(model_config: Module.Config) -> None:
+    """Make every weight FSDP shards a matrix sharded on dimension 0, the only
+    dimension FSDP2 lets a shard be uneven on.
+
+    Each feed-forward's stacked ``[2, F, D]`` w13 becomes separate ``[F, D]``
+    w1 and w3 linears (the layout before the stacked w13), and routed experts
+    store their weights 2-D (``GroupedLinear`` ``rows_on_dim0``), each with its
+    own ``init_seed``. Otherwise a shard on a later dimension, such as w13's F
+    rows or an expert's rows when there are more expert shards than experts,
+    must split evenly. Changes ``model_config`` in place; call it before the
+    model is built.
+    """
+    grouped_linears: list[GroupedLinear.Config] = []
+    for config in _iter_configs(model_config):
+        if isinstance(config, GroupedLinear.Config):
+            if any(config is seen for seen in grouped_linears):
+                raise ValueError(
+                    "Grouped linears sharing one config would draw the same "
+                    "initial weights."
+                )
+            grouped_linears.append(config)
+            config.rows_on_dim0 = True
+            config.init_seed = len(grouped_linears)
+        elif isinstance(config, FeedForward.Config) and config.w13 is not None:
+            w13 = config.w13
+            if w13.bias:
+                raise ValueError("Splitting a w13 with a bias isn't supported.")
+            fused_init = (w13.param_init or {}).get("weight")
+            if w13.param_init is not None and not isinstance(
+                fused_init, _FusedGateUpInit
+            ):
+                raise ValueError(
+                    "Splitting w13 needs its gate and up initializers "
+                    "(fused_gate_up_param_init)."
+                )
+            config.w1, config.w3 = (
+                dataclasses.replace(
+                    w13,
+                    num_linears=1,
+                    param_init=None if fused_init is None else {"weight": init},
+                    sharding_config=None,
+                )
+                for init in (
+                    (None, None)
+                    if fused_init is None
+                    else (fused_init.gate_init, fused_init.up_init)
+                )
+            )
+            config.w13 = None
+
+
+def _iter_configs(config: object):
+    """Every ``Module.Config`` in a config tree, ``config`` first."""
+    if isinstance(config, Module.Config):
+        yield config
+        for field in dataclasses.fields(config):
+            yield from _iter_configs(getattr(config, field.name))
+    elif isinstance(config, (list, tuple)):
+        for item in config:
+            yield from _iter_configs(item)
+    elif isinstance(config, dict):
+        for item in config.values():
+            yield from _iter_configs(item)
 
 
 def decoder_vocab_size(model_config: Module.Config) -> int:
