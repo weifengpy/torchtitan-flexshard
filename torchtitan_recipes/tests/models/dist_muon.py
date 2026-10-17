@@ -7,12 +7,18 @@
 """DistMuon optimizer configuration shared by the recipes of decoders built from
 DeepSeek V3's MLA attention and MoE blocks: Kimi K2.x, Moonlight and DeepSeek V3."""
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import cast
 
+import torch.nn as nn
 from torch.distributed.tensor import Shard
 
-from torchtitan.components.optim import AdamW, DistMuon, OptimizersContainer
+from torchtitan.components.optim import (
+    AdamW,
+    BaseOptimizer,
+    DistMuon,
+    OptimizersContainer,
+)
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed.flex_shard import (
     BlockShard,
@@ -20,6 +26,7 @@ from torchtitan.distributed.flex_shard import (
     ComputeLayout,
     Owned,
 )
+from torchtitan.distributed.flex_shard_fsdp import flex_shard_owner_map
 from torchtitan.distributed.parallelism_context import MeshAxisName
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.deepseek_v3.model import Attention as DeepSeekV3Attention
@@ -68,51 +75,94 @@ def per_expert_compute_layout(parallelism: ParallelismConfig) -> ComputeLayout:
     )
 
 
+class FlexShardOwnersOptimizersContainer(OptimizersContainer):
+    """``OptimizersContainer`` whose DistMuon computes each ``Owned`` Muon
+    parameter on the rank FlexShard + DistMuon stores it on
+    (``flex_shard_owner_map`` over ``owned_param_patterns``): FSDP2 + DistMuon
+    then runs the same Newton-Schulz work on every rank as FlexShard + DistMuon
+    does. FlexShard models already store parameters on their owners."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(OptimizersContainer.Config):
+        owned_param_patterns: list[str] = field(
+            default_factory=lambda: list(MLA_DIST_MUON_OWNED_PARAMS)
+        )
+
+    def __init__(
+        self,
+        config: Config,
+        *,
+        model_parts: list[nn.Module],
+        enable_cuda_graph: bool = False,
+    ) -> None:
+        if not any(hasattr(model, "bucket_storage_of") for model in model_parts):
+            owners = flex_shard_owner_map(model_parts, config.owned_param_patterns)
+            config = replace(
+                config,
+                optimizers=[
+                    replace(optimizer, owner_by_fqn=owners)
+                    if isinstance(optimizer, DistMuon.Config)
+                    else optimizer
+                    for optimizer in config.optimizers
+                ],
+            )
+        super().__init__(
+            config, model_parts=model_parts, enable_cuda_graph=enable_cuda_graph
+        )
+
+
 def mla_dist_muon_optimizer(
     model_config: Decoder.Config,
     *,
     muon_lr: float,
     adamw_lr: float,
     parallelism: ParallelismConfig,
+    flex_shard_layout: bool = False,
 ) -> OptimizersContainer.Config:
     """DistMuon for decoders built from DeepSeek V3's MLA attention and MoE
     blocks (DeepSeek V3, Kimi K2.x, Moonlight), with Kimi's Muon units: one
     matrix per logical projection, per MLA head where a projection is per head.
-    Dense-MLP layers are those without ``moe``. AdamW takes the rest."""
+    Dense-MLP layers are those without ``moe``. AdamW takes the rest.
+
+    With ``flex_shard_layout``, DistMuon computes every block matrix where
+    FlexShard + DistMuon stores it (``MLA_DIST_MUON_OWNED_PARAMS``): whole on
+    FlexShard's owner, per head there for the per-head projections, to compare
+    FSDP2 + DistMuon with FlexShard + DistMuon on the same Newton-Schulz work
+    per rank. Otherwise the per-head projections compute in place on the row
+    shards that hold their heads, and DistMuon places the owners itself."""
     attention = cast(DeepSeekV3Attention.Config, model_config.first_base_attention)
     owned = ComputeLayout(
         shardings_by_mesh_axis={
             MeshAxisName.DP_SHARD.value: Owned(),
         },
     )
-    # Kimi runs Newton-Schulz per logical projection within each MLA head.
-    per_query_head = ComputeLayout(
-        shardings_by_mesh_axis={
-            MeshAxisName.DP_SHARD.value: BlockShard(
-                dim=0,
-                # per head: [q_nope_h; q_rope_h]
-                block_sizes=(attention.qk_nope_head_dim, attention.qk_rope_head_dim),
-            )
-        },
-    )
+
+    def per_head(block_sizes: tuple[int, ...]) -> ComputeLayout:
+        # Kimi runs Newton-Schulz per logical projection within each MLA head.
+        return ComputeLayout(
+            shardings_by_mesh_axis={
+                MeshAxisName.DP_SHARD.value: (
+                    Owned(block_sizes=block_sizes)
+                    if flex_shard_layout
+                    else BlockShard(dim=0, block_sizes=block_sizes)
+                )
+            },
+        )
+
+    # per head: [q_nope_h; q_rope_h]
+    per_query_head = per_head((attention.qk_nope_head_dim, attention.qk_rope_head_dim))
+    # Shared projections [kv_latent; k_rope], whole on one owner: as two
+    # blocks, data-parallel rank 0 would take every layer's latent block and
+    # rank 1 every rope block.
     kv_latent_and_rope = ComputeLayout(
         shardings_by_mesh_axis={
-            MeshAxisName.DP_SHARD.value: BlockShard(
-                dim=0,
-                # Shared projections: [kv_latent; k_rope]
-                block_sizes=(attention.kv_lora_rank, attention.qk_rope_head_dim),
+            MeshAxisName.DP_SHARD.value: Owned(
+                block_sizes=(attention.kv_lora_rank, attention.qk_rope_head_dim)
             )
         },
     )
-    per_key_value_head = ComputeLayout(
-        shardings_by_mesh_axis={
-            MeshAxisName.DP_SHARD.value: BlockShard(
-                dim=0,
-                # per head: [k_nope_h; v_h]
-                block_sizes=(attention.qk_nope_head_dim, attention.v_head_dim),
-            )
-        },
-    )
+    # per head: [k_nope_h; v_h]
+    per_key_value_head = per_head((attention.qk_nope_head_dim, attention.v_head_dim))
     per_expert = per_expert_compute_layout(parallelism)
     query_shardings: dict[str, ComputeLayout] = (
         {
@@ -129,9 +179,9 @@ def mla_dist_muon_optimizer(
         "wo": owned,
     }
     feed_forward_shardings = {
-        "w13": ComputeLayout(
-            shardings_by_mesh_axis={MeshAxisName.DP_SHARD.value: Shard(0)},
-        ),
+        # [2, F, D]: gate and up, one batch of two on the owner. As slabs of
+        # Shard(0), data-parallel ranks 0 and 1 would take every layer's.
+        "w13": owned,
         "w2": owned,
     }
     num_layers = len(model_config.layers)
@@ -221,29 +271,30 @@ def mla_dist_muon_optimizer(
         r"moe\.shared_experts\.(?:w13|w2)\.weight"
         r")$"
     )
-    return OptimizersContainer.Config(
-        optimizers=[
-            DistMuon.Config(
-                pattern=muon_pattern,
-                bucket_configs=tuple(bucket_configs),
-                compute_sharding_by_fqn=compute_sharding_by_fqn,
-                lr=muon_lr,
-                weight_decay=0.1,
-                # Kimi K2 uses 0.2 * sqrt(max(rows, columns)) for
-                # shape-consistent AdamW-scale updates instead of Muon's
-                # original aspect-ratio scaling.
-                adjust_lr_fn="match_rms_adamw",
-            ),
-            # The remaining parameters are embeddings, norms, biases, LM head,
-            # and the vision tower.
-            AdamW.Config(
-                pattern=r".*",
-                foreach=True,
-                fused=False,
-                **adamw_kwargs,
-            ),
-        ],
-    )
+    optimizers: list[BaseOptimizer.Config] = [
+        DistMuon.Config(
+            pattern=muon_pattern,
+            bucket_configs=tuple(bucket_configs),
+            compute_sharding_by_fqn=compute_sharding_by_fqn,
+            lr=muon_lr,
+            weight_decay=0.1,
+            # Kimi K2 uses 0.2 * sqrt(max(rows, columns)) for
+            # shape-consistent AdamW-scale updates instead of Muon's
+            # original aspect-ratio scaling.
+            adjust_lr_fn="match_rms_adamw",
+        ),
+        # The remaining parameters are embeddings, norms, biases, LM head,
+        # and the vision tower.
+        AdamW.Config(
+            pattern=r".*",
+            foreach=True,
+            fused=False,
+            **adamw_kwargs,
+        ),
+    ]
+    if flex_shard_layout:
+        return FlexShardOwnersOptimizersContainer.Config(optimizers=optimizers)
+    return OptimizersContainer.Config(optimizers=optimizers)
 
 
 def align_dist_muon_expert_compute_layouts(
