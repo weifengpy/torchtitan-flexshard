@@ -170,6 +170,62 @@ class TestProfilerEnabledPaths(unittest.TestCase):
             with profiler:
                 self.assertIsNotNone(profiler.torch_profiler)
 
+    def _export_kwargs(self, *, cuda_graph_lanes, annotations):
+        """Run the profiler's trace handler; return export_chrome_trace's kwargs."""
+        import tempfile
+
+        captured = {}
+
+        def fake_profile(**kwargs):
+            captured.update(kwargs)
+            return mock.MagicMock()
+
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch("torch.profiler.profile", side_effect=fake_profile),
+            mock.patch(
+                "torchtitan.observability.profiler.get_cuda_graph_annotations",
+                return_value=annotations,
+            ),
+        ):
+            profiler = Profiler(
+                Profiler.Config(
+                    enable_profiling=True,
+                    profile_freq=4,
+                    profiler_warmup=1,
+                    profiler_active=1,
+                    cuda_graph_lanes=cuda_graph_lanes,
+                ),
+                global_step=0,
+                base_folder=tmpdir,
+            )
+            with profiler:
+                prof = mock.MagicMock(step_num=4)
+                captured["on_trace_ready"](prof)
+        prof.export_chrome_trace.assert_called_once()
+        return prof.export_chrome_trace.call_args.kwargs
+
+    def test_export_moves_annotated_graph_kernels_onto_lanes(self):
+        annotations = {7: [{"name": "layer 0"}]}
+        kwargs = self._export_kwargs(cuda_graph_lanes="all", annotations=annotations)
+        self.assertEqual(
+            kwargs, {"cuda_graph_annotations": annotations, "graph_lanes": "all"}
+        )
+
+    def test_export_keeps_streams_without_annotations(self):
+        with self.assertLogs("torchtitan.observability.profiler", level="WARNING"):
+            kwargs = self._export_kwargs(cuda_graph_lanes="all", annotations={})
+        self.assertEqual(kwargs, {})
+
+    def test_export_default_lanes_leave_streams(self):
+        annotations = {7: [{"name": "layer 0"}]}
+        kwargs = self._export_kwargs(cuda_graph_lanes="none", annotations=annotations)
+        self.assertEqual(kwargs, {"cuda_graph_annotations": annotations})
+
+    def test_cuda_graph_lanes_rejects_unknown_value(self):
+        with self.assertRaises(ValueError):
+            Profiler.Config(cuda_graph_lanes="some")
+
     def test_memory_snapshot_frequency_is_independent(self):
         import tempfile
 

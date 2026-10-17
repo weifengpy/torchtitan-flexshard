@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import contextlib
 from contextlib import nullcontext
 from typing import cast
 from unittest.mock import MagicMock, patch
@@ -13,8 +14,10 @@ import torch
 from torchtitan.distributed.cuda_graph import (
     _ForwardBackwardCUDAGraphWrapper,
     _manager,
+    cuda_graph_kernel_scope,
     CUDAGraphWrapper,
     get_cuda_graph_annotations,
+    name_cuda_graph_kernels,
     run_eager_on_cuda_graph_stream,
     wrap_with_cuda_graph,
 )
@@ -296,3 +299,84 @@ def test_cuda_graph_wrapper_requires_cleared_owned_gradients(
         parameter.grad = torch.ones_like(parameter)
         with pytest.raises(RuntimeError, match="must be None"):
             wrapper(torch.tensor(3.0))
+
+
+def _model_with_layers(*names: str) -> torch.nn.Module:
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleDict({name: torch.nn.Linear(2, 2) for name in names})
+    return model
+
+
+def test_name_cuda_graph_kernels_brackets_each_layer() -> None:
+    events: list[tuple[str, dict]] = []
+
+    @contextlib.contextmanager
+    def fake_mark_kernels(annotation):
+        events.append(("enter", annotation))
+        yield
+        events.append(("exit", annotation))
+
+    model = _model_with_layers("0", "1")
+    with (
+        patch("torch.cuda.graph_annotations.is_available", return_value=True),
+        patch(
+            "torch.cuda.graph_annotations.mark_kernels", side_effect=fake_mark_kernels
+        ),
+        patch.object(_manager, "kernel_names", False),
+    ):
+        assert name_cuda_graph_kernels([model])
+        with cuda_graph_kernel_scope({"name": "microbatch 0", "microbatch": 0}):
+            x = torch.ones(1, 2)
+            for layer in model.layers.values():
+                x = layer(x)
+
+    microbatch = {"name": "microbatch 0", "microbatch": 0}
+    layer0, layer1 = (
+        {"name": "layer 0", "layer": "0"},
+        {"name": "layer 1", "layer": "1"},
+    )
+    assert events == [
+        ("enter", microbatch),
+        ("enter", layer0),
+        ("exit", layer0),
+        ("enter", layer1),
+        ("exit", layer1),
+        ("exit", microbatch),
+    ]
+
+
+def test_name_cuda_graph_kernels_closes_scope_when_layer_raises() -> None:
+    open_scopes: list[dict] = []
+
+    @contextlib.contextmanager
+    def fake_mark_kernels(annotation):
+        open_scopes.append(annotation)
+        yield
+        open_scopes.remove(annotation)
+
+    model = _model_with_layers("0")
+    with (
+        patch("torch.cuda.graph_annotations.is_available", return_value=True),
+        patch(
+            "torch.cuda.graph_annotations.mark_kernels", side_effect=fake_mark_kernels
+        ),
+        patch.object(_manager, "kernel_names", False),
+    ):
+        assert name_cuda_graph_kernels([model])
+        with pytest.raises(RuntimeError):
+            model.layers["0"](torch.ones(1, 3))
+
+    assert open_scopes == []
+
+
+def test_name_cuda_graph_kernels_needs_driver_support() -> None:
+    model = _model_with_layers("0")
+    with (
+        patch("torch.cuda.graph_annotations.is_available", return_value=False),
+        patch.object(_manager, "kernel_names", False),
+    ):
+        assert not name_cuda_graph_kernels([model])
+        assert not model.layers["0"]._forward_pre_hooks
+        assert isinstance(
+            cuda_graph_kernel_scope({"name": "microbatch 0"}), nullcontext
+        )

@@ -31,8 +31,10 @@ from torchtitan.distributed.activation_checkpoint import (
 )
 from torchtitan.distributed.batch_invariant import set_batch_invariance
 from torchtitan.distributed.cuda_graph import (
+    cuda_graph_kernel_scope,
     cuda_graph_teardown,
     cuda_graphs_supported,
+    name_cuda_graph_kernels,
     NUM_CUDA_GRAPH_WARMUP_STEPS,
     wrap_fwd_bwd_with_cuda_graph,
 )
@@ -534,6 +536,8 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         if self.config.training.disable_cuda_graphs or not cuda_graphs_supported():
             return
 
+        if self.config.profiler.cuda_graph_kernel_names:
+            name_cuda_graph_kernels(self.model_parts)
         self._run_forward_backward = wrap_fwd_bwd_with_cuda_graph(
             eager_forward_backward_fn,
             parameters=(
@@ -667,54 +671,65 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         loss_metrics: list[dict[str, torch.Tensor]] = []
         num_accumulation_steps = len(microbatch_groups)
         for accumulation_index, prepared_inputs in enumerate(microbatch_groups):
-            is_last_accumulation_step = accumulation_index == num_accumulation_steps - 1
-
-            if self.parallelism_context.dp_replicate_enabled:
-                # All-reduce HSDP replicas only with the final accumulated gradient.
-                for model_part in self.model_parts:
-                    fsdp_root = cast(FSDPModule, model_part)
-                    fsdp_root.set_requires_all_reduce(is_last_accumulation_step)
-
-            self.loss_metrics = {}
-            if self.parallelism_context.pp_enabled:
-                arg_mbs, kwarg_mbs, target_mbs = prepared_inputs
-                # Finalization runs after the group's last PP microbatch.
-                loss = self._pp_forward_backward_microbatch_group(
-                    inputs=arg_mbs,
-                    model_kwargs=kwarg_mbs,
-                    labels=target_mbs,
-                    loss_kwargs={"global_loss_token_counts": global_loss_token_counts},
-                    finalize_gradients=(
-                        not defer_fsdp_gradient_reduction or is_last_accumulation_step
-                    ),
-                )
-            else:
-                if defer_fsdp_gradient_reduction:
-                    set_requires_gradient_sync(
-                        self.model_parts[0], is_last_accumulation_step
-                    )
-                inputs, labels, model_kwargs, loss_kwargs = prepared_inputs
-                loss = self._non_pp_forward_backward_microbatch(
-                    inputs=inputs,
-                    labels=labels,
-                    model_kwargs=model_kwargs,
-                    loss_kwargs={
-                        **loss_kwargs,
-                        "global_loss_token_counts": global_loss_token_counts,
-                    },
-                )
-
-            detached_loss = loss.detach()
-            if accumulated_loss is None:
-                accumulated_loss = detached_loss.clone()
-            else:
-                accumulated_loss.add_(detached_loss)
-            loss_metrics.append(
+            with cuda_graph_kernel_scope(
                 {
-                    key: value.detach().clone()
-                    for key, value in self.loss_metrics.items()
+                    "name": f"microbatch {accumulation_index}",
+                    "microbatch": accumulation_index,
                 }
-            )
+            ):
+                is_last_accumulation_step = (
+                    accumulation_index == num_accumulation_steps - 1
+                )
+
+                if self.parallelism_context.dp_replicate_enabled:
+                    # All-reduce HSDP replicas only with the final accumulated gradient.
+                    for model_part in self.model_parts:
+                        fsdp_root = cast(FSDPModule, model_part)
+                        fsdp_root.set_requires_all_reduce(is_last_accumulation_step)
+
+                self.loss_metrics = {}
+                if self.parallelism_context.pp_enabled:
+                    arg_mbs, kwarg_mbs, target_mbs = prepared_inputs
+                    # Finalization runs after the group's last PP microbatch.
+                    loss = self._pp_forward_backward_microbatch_group(
+                        inputs=arg_mbs,
+                        model_kwargs=kwarg_mbs,
+                        labels=target_mbs,
+                        loss_kwargs={
+                            "global_loss_token_counts": global_loss_token_counts
+                        },
+                        finalize_gradients=(
+                            not defer_fsdp_gradient_reduction
+                            or is_last_accumulation_step
+                        ),
+                    )
+                else:
+                    if defer_fsdp_gradient_reduction:
+                        set_requires_gradient_sync(
+                            self.model_parts[0], is_last_accumulation_step
+                        )
+                    inputs, labels, model_kwargs, loss_kwargs = prepared_inputs
+                    loss = self._non_pp_forward_backward_microbatch(
+                        inputs=inputs,
+                        labels=labels,
+                        model_kwargs=model_kwargs,
+                        loss_kwargs={
+                            **loss_kwargs,
+                            "global_loss_token_counts": global_loss_token_counts,
+                        },
+                    )
+
+                detached_loss = loss.detach()
+                if accumulated_loss is None:
+                    accumulated_loss = detached_loss.clone()
+                else:
+                    accumulated_loss.add_(detached_loss)
+                loss_metrics.append(
+                    {
+                        key: value.detach().clone()
+                        for key, value in self.loss_metrics.items()
+                    }
+                )
 
         assert accumulated_loss is not None
         return ForwardBackwardResult(accumulated_loss, loss_metrics)
