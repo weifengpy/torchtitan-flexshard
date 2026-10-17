@@ -6,7 +6,7 @@
 
 """Parallelism configuration."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import get_args, Literal, TypeAlias
 
 import torch
@@ -78,6 +78,16 @@ class ParallelismConfig:
     with one ``fsdp2_compatible`` bucket per FSDP2 group, so training is bitwise
     identical to "fsdp2". FlexShard does not support HSDP, tensor, context or
     pipeline parallelism, or symmetric-memory communication yet.
+    """
+
+    flex_shard_owned_params: list[str] = field(default_factory=list)
+    """
+    With ``fsdp_backend="flex_shard"``, regex patterns of parameter FQNs that
+    FlexShard stores whole on one owner rank (``BucketedOwned``), in their own
+    bucket per transformer block. They initialize and load like the other
+    parameters, then move to their owners once. For optimizers that update
+    whole matrices on one rank, e.g. DistMuon's ``Owned`` compute layouts, whose
+    step then runs without communication.
     """
 
     tensor_parallel_degree: int = 1
@@ -248,6 +258,11 @@ class ParallelismConfig:
             raise ValueError(
                 f"parallelism.fsdp_backend must be one of {list(_FSDP_BACKENDS)} "
                 f"(got {self.fsdp_backend!r})"
+            )
+        if self.flex_shard_owned_params and self.fsdp_backend != "flex_shard":
+            raise ValueError(
+                "parallelism.flex_shard_owned_params needs "
+                "parallelism.fsdp_backend='flex_shard'."
             )
         if self.fsdp_backend == "flex_shard":
             unsupported = [

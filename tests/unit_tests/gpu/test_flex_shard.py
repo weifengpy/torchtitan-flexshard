@@ -38,6 +38,7 @@ from torchtitan.distributed.cuda_graph import (
     NUM_CUDA_GRAPH_WARMUP_STEPS,
     wrap_fwd_bwd_with_cuda_graph,
 )
+from torchtitan.distributed.flex_shard_fsdp import relayout_owned_buckets
 from torchtitan.distributed.fsdp import get_fsdp_group, set_requires_gradient_sync
 from torchtitan.distributed.parallelism_context import ParallelismContext
 from torchtitan.models.common.attention.attention import FlexInnerAttention
@@ -78,6 +79,7 @@ class TestFlexShardDecoder(DTensorTestBase):
         reshard_after_forward: str,
         parallelism_context: ParallelismContext,
         build_config=build_model_config,
+        owned_params: tuple[str, ...] = (),
     ):
         parallelism = ParallelismConfig(
             data_parallel_shard_degree=parallelism_context.dp_shard,
@@ -87,6 +89,7 @@ class TestFlexShardDecoder(DTensorTestBase):
             expert_parallel_degree=parallelism_context.ep,
             fsdp_backend=fsdp_backend,
             fsdp_reshard_after_forward=reshard_after_forward,
+            flex_shard_owned_params=list(owned_params),
         )
         model_config = build_config("debugmodel", seq_len=_seq_len(parallelism_context))
         if parallelism_context.cp > 1:
@@ -117,6 +120,9 @@ class TestFlexShardDecoder(DTensorTestBase):
             model.to_empty(device=self.device_type)
             with torch.no_grad():
                 model.init_weights(buffer_device=None)
+            if owned_params:
+                # As the trainer does after initialization.
+                relayout_owned_buckets(model, owned_params)
         return model, model_config, parallelism, parallelism_context
 
     def _train(
@@ -133,6 +139,7 @@ class TestFlexShardDecoder(DTensorTestBase):
         spmd_typechecking=False,
         defer_gradient_reduction=True,
         cuda_graphs=False,
+        max_norm=1.0,
     ):
         if optim is None:
             optim = torch.optim.AdamW(model.parameters(), lr=1e-3, foreach=True)
@@ -241,7 +248,7 @@ class TestFlexShardDecoder(DTensorTestBase):
             losses = list(forward_backward(prepared_microbatches).clone())
             grad_norm = dist_utils.clip_grad_norm_(
                 list(model.parameters()),
-                max_norm=1.0,
+                max_norm=max_norm,
                 foreach=True,
                 ep_enabled=parallelism_context.ep_enabled,
             )
@@ -384,6 +391,75 @@ class TestFlexShardDecoder(DTensorTestBase):
             build_deepseek_v3_model_config,
             spmd_typechecking=True,
         )
+
+    @with_comms
+    def test_dist_muon_without_optimizer_communication(self):
+        # DistMuon as the DeepSeek V3 recipe sets it up, with whole experts on
+        # each rank (ep 4). FlexShard stores the matrices DistMuon computes on
+        # one rank whole on owners (MLA_DIST_MUON_OWNED_PARAMS) and runs
+        # DistMuon on each rank's local storage: its losses equal FSDP2's bit for
+        # bit over 3 steps, with clipping off (grad norms may round apart, as
+        # owners split the sum of squares differently), and its DistMuon step
+        # runs no collectives, while FSDP2's redistributes.
+        from torchtitan_recipes.tests.models.dist_muon import (
+            mla_dist_muon_optimizer,
+            MLA_DIST_MUON_OWNED_PARAMS,
+        )
+
+        parallelism_context = ParallelismContext(
+            dp_replicate=1,
+            dp_shard=self.world_size,
+            cp=1,
+            tp=1,
+            pp=1,
+            ep=self.world_size,
+            world_size=self.world_size,
+            enable_sequence_parallel=False,
+        )
+        losses, collectives = {}, {}
+        for backend, owned in (
+            ("fsdp2", ()),
+            ("flex_shard", MLA_DIST_MUON_OWNED_PARAMS),
+        ):
+            model, *setup = self._build(
+                backend,
+                "default",
+                parallelism_context,
+                build_deepseek_v3_model_config,
+                owned_params=owned,
+            )
+            model_config, parallelism, _ = setup
+            optim = mla_dist_muon_optimizer(
+                model_config, muon_lr=8e-4, adamw_lr=8e-4, parallelism=parallelism
+            ).build(model_parts=[model])
+            (dist_muon,) = [
+                o for o in optim.optimizers if "DistMuon" in type(o).__name__
+            ]
+            collectives[backend] = []
+            step = dist_muon.step
+
+            def profiled_step(*args, _step=step, _calls=collectives[backend]):
+                with torch.profiler.profile(
+                    activities=[torch.profiler.ProfilerActivity.CPU]
+                ) as prof:
+                    out = _step(*args)
+                _calls.append(
+                    sum(event.name.startswith("c10d::") for event in prof.events())
+                )
+                return out
+
+            dist_muon.step = profiled_step
+            history = self._train(model, *setup, 1, False, optim=optim, max_norm=1e9)
+            losses[backend] = [losses_of_step for losses_of_step, *_ in history]
+        for step, (expected, actual) in enumerate(
+            zip(losses["fsdp2"], losses["flex_shard"], strict=True)
+        ):
+            for expected_loss, actual_loss in zip(expected, actual, strict=True):
+                self.assertTrue(
+                    torch.equal(expected_loss, actual_loss), msg=f"step {step} loss"
+                )
+        self.assertEqual(collectives["flex_shard"], [0, 0, 0])
+        self.assertTrue(all(collectives["fsdp2"]), collectives["fsdp2"])
 
     @with_comms
     def test_matches_fsdp2_with_cuda_graphs(self):
