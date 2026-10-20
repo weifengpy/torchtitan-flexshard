@@ -64,7 +64,7 @@ Requirements:
   [pytorch/pytorch#200179](https://github.com/pytorch/pytorch/pull/200179). Any
   nightly from 2.16.0.dev20261009 on has both.
 - FlexShard from meta-pytorch/flex_shard `main`, at
-  [8df085a](https://github.com/meta-pytorch/flex_shard/commit/8df085a92b3c44bee38c914edccb84a2e9d72af0) or later,
+  [7cdaf16](https://github.com/meta-pytorch/flex_shard/commit/7cdaf16f5664bda918fc57cb588b4a2095217a3c) or later,
   which has everything this fork uses:
 
   ```bash
