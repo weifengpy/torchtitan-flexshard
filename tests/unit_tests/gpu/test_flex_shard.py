@@ -395,12 +395,12 @@ class TestFlexShardDecoder(DTensorTestBase):
     @with_comms
     def test_dist_muon_without_optimizer_communication(self):
         # DistMuon as the DeepSeek V3 recipe sets it up, with whole experts on
-        # each rank (ep 4). FlexShard stores the matrices DistMuon computes on
-        # one rank whole on owners (MLA_DIST_MUON_OWNED_PARAMS) and runs
-        # DistMuon on each rank's local storage: its losses equal FSDP2's bit for
-        # bit over 3 steps, with clipping off (grad norms may round apart, as
-        # owners split the sum of squares differently), and its DistMuon step
-        # runs no collectives, while FSDP2's redistributes.
+        # each rank (ep 4). FlexShard stores every block parameter outside the
+        # routed experts whole on owners (MLA_DIST_MUON_OWNED_PARAMS), one bucket
+        # per block, and runs DistMuon on each rank's local storage: its losses
+        # equal FSDP2's bit for bit over 3 steps, with clipping off (grad norms
+        # may round apart, as owners split the sum of squares differently), and
+        # its DistMuon step runs no collectives, while FSDP2's redistributes.
         from torchtitan_recipes.tests.models.dist_muon import (
             mla_dist_muon_optimizer,
             MLA_DIST_MUON_OWNED_PARAMS,
@@ -429,6 +429,28 @@ class TestFlexShardDecoder(DTensorTestBase):
                 owned_params=owned,
             )
             model_config, parallelism, _ = setup
+            if backend == "flex_shard":
+                # pyrefly: ignore [missing-import]
+                from flex_shard.custom_placements.owned import BucketedOwned
+
+                buckets_per_block: dict[str, int] = {}
+                for storage in model.sharded_bucket_storages:
+                    fqns = [
+                        fqn
+                        for fqn in storage.param_infos
+                        if fqn.startswith("layers.") and ".routed_experts." not in fqn
+                    ]
+                    if not fqns:
+                        continue
+                    block = ".".join(fqns[0].split(".")[:2])
+                    buckets_per_block[block] = buckets_per_block.get(block, 0) + 1
+                    for fqn in fqns:
+                        self.assertIsInstance(
+                            storage.param_infos[fqn].placement, BucketedOwned, fqn
+                        )
+                self.assertEqual(
+                    set(buckets_per_block.values()), {1}, buckets_per_block
+                )
             optim = mla_dist_muon_optimizer(
                 model_config, muon_lr=8e-4, adamw_lr=8e-4, parallelism=parallelism
             ).build(model_parts=[model])
