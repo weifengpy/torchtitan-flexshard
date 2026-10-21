@@ -88,7 +88,10 @@ class DistMuon(FlexShardDistMuon, BaseOptimizer):
         *,
         params: Iterable[dict[str, Any]] | Iterable[Tensor],
     ) -> None:
-        super().__init__(
+        # The same call as super().__init__, but type checkers without
+        # flex_shard, as in CI, would check super() against Optimizer's.
+        FlexShardDistMuon.__init__(
+            self,
             cast(Iterable[dict[str, Any]], params),
             compute_sharding_by_fqn=config.compute_sharding_by_fqn,
             bucket_configs=config.bucket_configs,
@@ -156,7 +159,7 @@ def _local_compute_layout(compute_layout: ComputeLayout, axis: str) -> ComputeLa
 
 
 def _build_flex_shard_dist_muon(
-    config: BaseOptimizer.Config,
+    config: DistMuon.Config,
     model: nn.Module,
     param_group: dict[str, Any],
 ) -> Optimizer | None:
@@ -177,7 +180,6 @@ def _build_flex_shard_dist_muon(
     than it has Muon parameters: the rank has no Muon work there, and the step
     runs no collectives that other ranks would wait on.
     """
-    assert isinstance(config, DistMuon.Config)
     # pyrefly: ignore [missing-import]
     from flex_shard import get_placements
 

@@ -11,7 +11,7 @@ import re
 import sys
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
-from typing import Any, Literal, overload
+from typing import Any, Literal, overload, TYPE_CHECKING, TypeGuard
 
 import torch
 import torch.nn as nn
@@ -27,6 +27,9 @@ from .utils import (
     init_optim_state,
     load_flat_optim_state_dict,
 )
+
+if TYPE_CHECKING:
+    from .dist_muon import DistMuon
 
 logger = logging.getLogger(__name__)
 
@@ -178,7 +181,7 @@ class AdamW(torch.optim.AdamW, BaseOptimizer):
             _register_bfloat16_moment_hooks(self)
 
 
-def _is_dist_muon_config(config: BaseOptimizer.Config) -> bool:
+def _is_dist_muon_config(config: BaseOptimizer.Config) -> TypeGuard[DistMuon.Config]:
     """Whether ``config`` is a DistMuon config, without importing DistMuon's
     module, which needs the optional flex_shard: a DistMuon config can exist
     only once that module is loaded."""
@@ -271,12 +274,11 @@ class OptimizersContainer(Optimizer, Stateful, Configurable):
                 )
                 # FlexShard's root module finds the bucket of a parameter.
                 flex_shard_model = hasattr(model, "bucket_storage_of")
-                local_dist_muon = flex_shard_model and _is_dist_muon_config(
-                    optimizer_config
-                )
-                if local_dist_muon:
+                local_dist_muon = False
+                if flex_shard_model and _is_dist_muon_config(optimizer_config):
                     from .dist_muon import _build_flex_shard_dist_muon
 
+                    local_dist_muon = True
                     optimizer = _build_flex_shard_dist_muon(
                         optimizer_config, model, param_group
                     )
