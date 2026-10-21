@@ -15,21 +15,23 @@ from torchtitan.components.data import GrainDataLoader, SingleDatasetConfig
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.optim import (
     AdamW,
-    DistMuon,
     LRSchedulersContainer,
     Optim,
     OptimizersContainer,
+)
+
+# Raises with install steps when the optional flex_shard is missing.
+from torchtitan.components.optim.dist_muon import (
+    BlockShard,
+    BucketConfig,
+    ComputeLayout,
+    DistMuon,
+    Owned,
 )
 from torchtitan.components.tokenizer import MultiModalTokenizer
 from torchtitan.config import TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
-from torchtitan.distributed.flex_shard import (
-    BlockShard,
-    BucketConfig,
-    ComputeLayout,
-    Owned,
-)
 from torchtitan.distributed.parallelism_context import MeshAxisName
 from torchtitan.hf_datasets.multimodal.mm_collator import MultiModalCollator
 from torchtitan.hf_datasets.multimodal.mm_datasets import MM_DATASETS, VisionProcessor

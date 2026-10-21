@@ -7,13 +7,12 @@
 from .ema import EMA
 from .lr_scheduler import LRSchedulersContainer
 from .optim import Optim
-from .optimizer import Adam, AdamW, BaseOptimizer, DistMuon, OptimizersContainer
+from .optimizer import Adam, AdamW, BaseOptimizer, OptimizersContainer
 
 __all__ = [
     "Adam",
     "AdamW",
     "BaseOptimizer",
-    "DistMuon",
     "EMA",
     "LRSchedulersContainer",
     "OptimizersContainer",

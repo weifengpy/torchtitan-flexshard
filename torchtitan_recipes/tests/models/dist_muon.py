@@ -13,19 +13,17 @@ from typing import cast
 import torch.nn as nn
 from torch.distributed.tensor import Shard
 
-from torchtitan.components.optim import (
-    AdamW,
-    BaseOptimizer,
-    DistMuon,
-    OptimizersContainer,
-)
-from torchtitan.config.parallelism import ParallelismConfig
-from torchtitan.distributed.flex_shard import (
+from torchtitan.components.optim import AdamW, BaseOptimizer, OptimizersContainer
+
+# Raises with install steps when the optional flex_shard is missing.
+from torchtitan.components.optim.dist_muon import (
     BlockShard,
     BucketConfig,
     ComputeLayout,
+    DistMuon,
     Owned,
 )
+from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed.flex_shard_fsdp import flex_shard_owner_map
 from torchtitan.distributed.parallelism_context import MeshAxisName
 from torchtitan.models.common.decoder import Decoder

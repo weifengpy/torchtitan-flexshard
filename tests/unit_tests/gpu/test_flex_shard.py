@@ -403,10 +403,11 @@ class TestFlexShardDecoder(DTensorTestBase):
         # its DistMuon step runs no collectives, while FSDP2's redistributes.
         # FSDP2's DistMuon takes FlexShard's layout (flex_shard_layout): each of
         # those matrices computes on the rank FlexShard stores it on.
-        from torchtitan.components.checkpointer.utils import canonical_fqn
-        from torchtitan.distributed.flex_shard._optimizer_reshard_schedule import (
+        # pyrefly: ignore [missing-import]
+        from flex_shard.dist_muon._optimizer_reshard_schedule import (
             _RedistributionBucketPlan,
         )
+        from torchtitan.components.checkpointer.utils import canonical_fqn
         from torchtitan_recipes.tests.models.dist_muon import (
             mla_dist_muon_optimizer,
             MLA_DIST_MUON_OWNED_PARAMS,

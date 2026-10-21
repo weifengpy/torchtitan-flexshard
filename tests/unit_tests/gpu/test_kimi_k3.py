@@ -9,7 +9,7 @@ import unittest
 import torch
 from torch.nn.attention.flex_attention import BlockMask
 
-from torchtitan.components.optim import DistMuon
+from torchtitan.components.optim.dist_muon import DistMuon
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.models.common.attention import KDAAttentionMetadata
 from torchtitan.models.common.attention.kda import KDAKernel
