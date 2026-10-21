@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import importlib.util
 import unittest
 from dataclasses import dataclass
 from tempfile import TemporaryDirectory
@@ -441,6 +442,10 @@ class TestOptimizerConfig(unittest.TestCase):
         with self.assertRaises(ValueError):
             config.build(model_parts=[model])
 
+    @unittest.skipIf(
+        importlib.util.find_spec("flex_shard") is None,
+        "DistMuon needs the optional flex_shard",
+    )
     def test_flex_shard_dist_muon_without_local_params(self):
         """A FlexShard rank that stores none of a model part's Muon parameters
         (each whole on another owner) gets no DistMuon for that part: the
@@ -448,7 +453,7 @@ class TestOptimizerConfig(unittest.TestCase):
         the other optimizers run as usual."""
         from unittest import mock
 
-        from torchtitan.components.optim import DistMuon
+        from torchtitan.components.optim.dist_muon import DistMuon
 
         model = SimpleModel()
         # FlexShard's root modules carry bucket_storage_of.
@@ -464,7 +469,7 @@ class TestOptimizerConfig(unittest.TestCase):
             ],
         )
         with mock.patch(
-            "torchtitan.components.optim.optimizer._build_flex_shard_dist_muon",
+            "torchtitan.components.optim.dist_muon._build_flex_shard_dist_muon",
             return_value=None,
         ):
             container = config.build(model_parts=[model])
