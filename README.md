@@ -63,13 +63,12 @@ Requirements:
   [pytorch/pytorch#197204](https://github.com/pytorch/pytorch/pull/197204) and
   [pytorch/pytorch#200179](https://github.com/pytorch/pytorch/pull/200179). Any
   nightly from 2.16.0.dev20261009 on has both.
-- FlexShard from meta-pytorch/flex_shard `main`, at
-  [34dd58b](https://github.com/meta-pytorch/flex_shard/commit/34dd58b13d706eb1799c00d95d5cac16b26df796) or later,
-  which has everything this fork uses, including DistMuon (`flex_shard.dist_muon`):
+- FlexShard from meta-pytorch/flex_shard's `fp8-stack` branch: `main` plus the
+  blockwise FP8 stack, which this branch's FP8 options use:
 
   ```bash
   pip install torchao
-  pip install --no-deps "git+https://github.com/meta-pytorch/flex_shard.git@main"
+  pip install --no-deps "git+https://github.com/meta-pytorch/flex_shard.git@fp8-stack"
   ```
 
 Download the tokenizer:
