@@ -11,16 +11,17 @@ from dataclasses import dataclass, field, replace
 from typing import cast
 
 import torch.nn as nn
-
-# pyrefly: ignore [missing-import]
-from flex_shard.dist_muon import BlockShard, BucketConfig, ComputeLayout, Owned
 from torch.distributed.tensor import Shard
 
-from torchtitan.components.optim import (
-    AdamW,
-    BaseOptimizer,
+from torchtitan.components.optim import AdamW, BaseOptimizer, OptimizersContainer
+
+# Raises with install steps when the optional flex_shard is missing.
+from torchtitan.components.optim.dist_muon import (
+    BlockShard,
+    BucketConfig,
+    ComputeLayout,
     DistMuon,
-    OptimizersContainer,
+    Owned,
 )
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed.flex_shard_fsdp import flex_shard_owner_map

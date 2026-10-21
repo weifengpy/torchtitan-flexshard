@@ -42,11 +42,6 @@ from torchtitan_recipes.models.deepseek_v3 import (
     deepseek_v3_mxfp8_linear_converter_config,
 )
 
-from torchtitan_recipes.tests.models.dist_muon import (
-    DistMuonTrainerConfig,
-    mla_dist_muon_optimizer,
-)
-
 
 def deepseek_v3_debugmodel(
     seq_len: int | None = DEFAULT_DEBUG_MODEL_SEQ_LEN,
@@ -110,6 +105,13 @@ def deepseek_v3_debugmodel_dist_muon(
 ) -> Trainer.Config:
     """The debug model with DistMuon for its matrix parameters, as the Kimi
     recipes set it up (``mla_dist_muon_optimizer``)."""
+    # DistMuon needs the optional flex_shard; this import raises with install
+    # steps when it is missing.
+    from torchtitan_recipes.tests.models.dist_muon import (
+        DistMuonTrainerConfig,
+        mla_dist_muon_optimizer,
+    )
+
     config = deepseek_v3_debugmodel(seq_len=seq_len)
     config.optim.optimizer = mla_dist_muon_optimizer(
         config.model,

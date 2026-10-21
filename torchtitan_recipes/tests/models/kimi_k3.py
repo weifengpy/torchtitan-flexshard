@@ -9,19 +9,24 @@
 from dataclasses import dataclass, replace
 from typing import cast
 
-# pyrefly: ignore [missing-import]
-from flex_shard.dist_muon import BlockShard, BucketConfig, ComputeLayout, Owned
-
 from torch.distributed.tensor import Shard
 
 from torchtitan.components.data import GrainDataLoader, SingleDatasetConfig
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.optim import (
     AdamW,
-    DistMuon,
     LRSchedulersContainer,
     Optim,
     OptimizersContainer,
+)
+
+# Raises with install steps when the optional flex_shard is missing.
+from torchtitan.components.optim.dist_muon import (
+    BlockShard,
+    BucketConfig,
+    ComputeLayout,
+    DistMuon,
+    Owned,
 )
 from torchtitan.components.tokenizer import MultiModalTokenizer
 from torchtitan.config import TrainingConfig
