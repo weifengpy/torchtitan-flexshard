@@ -64,8 +64,8 @@ Requirements:
   [pytorch/pytorch#200179](https://github.com/pytorch/pytorch/pull/200179). Any
   nightly from 2.16.0.dev20261009 on has both.
 - FlexShard from meta-pytorch/flex_shard `main`, at
-  [7cdaf16](https://github.com/meta-pytorch/flex_shard/commit/7cdaf16f5664bda918fc57cb588b4a2095217a3c) or later,
-  which has everything this fork uses:
+  [34dd58b](https://github.com/meta-pytorch/flex_shard/commit/34dd58b13d706eb1799c00d95d5cac16b26df796) or later,
+  which has everything this fork uses, including DistMuon (`flex_shard.dist_muon`):
 
   ```bash
   pip install torchao

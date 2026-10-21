@@ -15,6 +15,16 @@ from typing import Any, cast, Literal, overload
 
 import torch
 import torch.nn as nn
+
+# DistMuon lives in FlexShard (meta-pytorch/flex_shard).
+# pyrefly: ignore [missing-import]
+from flex_shard.dist_muon import (
+    BlockShard,
+    BucketConfig,
+    ComputeLayout,
+    DistMuon as FlexShardDistMuon,
+    Owned,
+)
 from torch import Tensor
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.tensor import Replicate, Shard
@@ -22,14 +32,6 @@ from torch.optim import Optimizer
 
 from torchtitan.components.checkpointer.utils import canonical_fqn
 from torchtitan.config import Configurable
-
-from torchtitan.distributed.flex_shard import (
-    BlockShard,
-    BucketConfig,
-    ComputeLayout,
-    DistMuon as FlexShardDistMuon,
-    Owned,
-)
 
 from .utils import (
     get_flat_optim_state_dict,
@@ -318,7 +320,8 @@ def _build_flex_shard_dist_muon(
     # pyrefly: ignore [missing-import]
     from flex_shard.dist_muon import build_local_dist_muon
 
-    from torchtitan.distributed.flex_shard.dist_muon import (
+    # pyrefly: ignore [missing-import]
+    from flex_shard.dist_muon.optimizer import (
         _NoRedistributionTransition,
         _resolve_storage_to_compute_transition,
     )

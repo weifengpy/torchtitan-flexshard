@@ -11,6 +11,9 @@ from dataclasses import dataclass, field, replace
 from typing import cast
 
 import torch.nn as nn
+
+# pyrefly: ignore [missing-import]
+from flex_shard.dist_muon import BlockShard, BucketConfig, ComputeLayout, Owned
 from torch.distributed.tensor import Shard
 
 from torchtitan.components.optim import (
@@ -20,12 +23,6 @@ from torchtitan.components.optim import (
     OptimizersContainer,
 )
 from torchtitan.config.parallelism import ParallelismConfig
-from torchtitan.distributed.flex_shard import (
-    BlockShard,
-    BucketConfig,
-    ComputeLayout,
-    Owned,
-)
 from torchtitan.distributed.flex_shard_fsdp import flex_shard_owner_map
 from torchtitan.distributed.parallelism_context import MeshAxisName
 from torchtitan.models.common.decoder import Decoder

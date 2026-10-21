@@ -9,6 +9,9 @@
 from dataclasses import dataclass, replace
 from typing import cast
 
+# pyrefly: ignore [missing-import]
+from flex_shard.dist_muon import BlockShard, BucketConfig, ComputeLayout, Owned
+
 from torch.distributed.tensor import Shard
 
 from torchtitan.components.data import GrainDataLoader, SingleDatasetConfig
@@ -24,12 +27,6 @@ from torchtitan.components.tokenizer import MultiModalTokenizer
 from torchtitan.config import TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
-from torchtitan.distributed.flex_shard import (
-    BlockShard,
-    BucketConfig,
-    ComputeLayout,
-    Owned,
-)
 from torchtitan.distributed.parallelism_context import MeshAxisName
 from torchtitan.hf_datasets.multimodal.mm_collator import MultiModalCollator
 from torchtitan.hf_datasets.multimodal.mm_datasets import MM_DATASETS, VisionProcessor
