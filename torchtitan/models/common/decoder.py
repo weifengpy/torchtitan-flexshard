@@ -174,6 +174,7 @@ class Decoder(BaseModel):
                 ep_degree=parallelism_context.ep,
                 edp_mesh=edp_mesh,
                 owned_param_patterns=parallelism.flex_shard_owned_params,
+                full_graph=parallelism.flex_shard_full_graph,
             )
             return
         apply_fsdp_to_decoder(
