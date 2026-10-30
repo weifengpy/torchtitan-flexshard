@@ -19,6 +19,7 @@ import torch.distributed.checkpoint as dcp
 from torch.distributed.checkpoint.format_utils import dcp_to_torch_save
 from torch.distributed.checkpoint.metadata import TensorStorageMetadata
 from torch.distributed.tensor import DTensor
+from torch.nn.attention.flex_attention import flex_attention
 from torch.testing._internal.distributed._tensor.common_dtensor import (
     DTensorTestBase,
     with_comms,
@@ -80,6 +81,7 @@ class TestFlexShardDecoder(DTensorTestBase):
         parallelism_context: ParallelismContext,
         build_config=build_model_config,
         owned_params: tuple[str, ...] = (),
+        full_graph: bool = False,
     ):
         parallelism = ParallelismConfig(
             data_parallel_shard_degree=parallelism_context.dp_shard,
@@ -90,6 +92,7 @@ class TestFlexShardDecoder(DTensorTestBase):
             fsdp_backend=fsdp_backend,
             fsdp_reshard_after_forward=reshard_after_forward,
             flex_shard_owned_params=list(owned_params),
+            flex_shard_full_graph=full_graph,
         )
         model_config = build_config("debugmodel", seq_len=_seq_len(parallelism_context))
         if parallelism_context.cp > 1:
@@ -365,6 +368,69 @@ class TestFlexShardDecoder(DTensorTestBase):
         self._check_matches_fsdp2(
             parallelism_context, [("default", 1)], spmd_typechecking=True
         )
+
+    def _capture_history(self, compiled: bool):
+        parallelism_context = ParallelismContext(
+            dp_replicate=1,
+            dp_shard=self.world_size,
+            cp=1,
+            tp=1,
+            pp=1,
+            ep=1,
+            world_size=self.world_size,
+            enable_sequence_parallel=False,
+        )
+        model, *setup = self._build(
+            "flex_shard", "default", parallelism_context, full_graph=True
+        )
+        graphs = []
+        if compiled:
+            aot_eager = torch._dynamo.lookup_backend("aot_eager")
+
+            def backend(graph_module, example_inputs):
+                graphs.append(graph_module)
+                return aot_eager(graph_module, example_inputs)
+
+            torch._dynamo.reset()
+
+            # A function that calls the model, as a training step would: called
+            # from traced code, the decoder's own hooks inline into the graph.
+            def call(*args, **kwargs):
+                return model._call_impl(*args, **kwargs)
+
+            model._compiled_call_impl = torch.compile(
+                call, backend=backend, fullgraph=True
+            )
+        history = self._train(model, *setup, microbatches=1, chunked_loss=False)
+        return history, graphs, len(model.sharded_bucket_storages)
+
+    @with_comms
+    def test_full_graph_capture_matches_eager(self):
+        # FlexAttention's reference math in both modes: eager mode otherwise runs
+        # its own compiled kernel, which a full-graph capture inlines.
+        FlexInnerAttention._compiled_flex_attn = flex_attention
+        eager, _, _ = self._capture_history(compiled=False)
+        compiled, graphs, buckets = self._capture_history(compiled=True)
+        # One graph, with one all-gather and one reduce-scatter per bucket in the
+        # bucket ops' forward and backward bodies.
+        self.assertEqual(len(graphs), 1)
+        targets = [
+            str(node.target)
+            for _, module in graphs[0].named_modules()
+            if isinstance(module, torch.fx.GraphModule)
+            for node in module.graph.nodes
+        ]
+        for collective in ("all_gather_into_tensor", "reduce_scatter_tensor"):
+            self.assertEqual(
+                targets.count(f"_c10d_functional.{collective}"), buckets, collective
+            )
+        for step, (expected, actual) in enumerate(zip(eager, compiled)):
+            self.assertEqual(expected[0], actual[0], msg=f"step {step} loss")
+            self.assertTrue(
+                torch.equal(expected[1], actual[1]), msg=f"step {step} grad norm"
+            )
+            self._assert_equal_tensors(expected[2], actual[2], f"step {step} grad")
+            self._assert_equal_tensors(expected[3], actual[3], f"step {step} param")
 
     @with_comms
     def test_matches_fsdp2_with_expert_parallelism(self):

@@ -80,6 +80,15 @@ class ParallelismConfig:
     pipeline parallelism, or symmetric-memory communication yet.
     """
 
+    flex_shard_full_graph: bool = False
+    """
+    With ``fsdp_backend="flex_shard"``, prepare the buckets for capturing the
+    whole model as one graph with ``torch.compile(fullgraph=True)``, as SimpleFSDP
+    is compiled: an FSDP2 group of several modules, such as the final norm with the
+    output projection, becomes a bucket named by their parameters, with the same
+    placements and order. Eager training keeps FSDP2's module hooks by default.
+    """
+
     flex_shard_owned_params: list[str] = field(default_factory=list)
     """
     With ``fsdp_backend="flex_shard"``, regex patterns of parameter FQNs that
@@ -258,6 +267,11 @@ class ParallelismConfig:
             raise ValueError(
                 f"parallelism.fsdp_backend must be one of {list(_FSDP_BACKENDS)} "
                 f"(got {self.fsdp_backend!r})"
+            )
+        if self.flex_shard_full_graph and self.fsdp_backend != "flex_shard":
+            raise ValueError(
+                "parallelism.flex_shard_full_graph needs "
+                "parallelism.fsdp_backend='flex_shard'."
             )
         if self.flex_shard_owned_params and self.fsdp_backend != "flex_shard":
             raise ValueError(
