@@ -78,6 +78,7 @@ def apply_flex_shard_to_decoder(
     edp_mesh: DeviceMesh | None = None,
     extra_blocks: Sequence[tuple[str, nn.Module]] = (),
     owned_param_patterns: Sequence[str] = (),
+    full_graph: bool = False,
 ) -> None:
     """Shard a decoder with FlexShard as ``apply_fsdp_to_decoder`` does with FSDP2.
 
@@ -122,6 +123,10 @@ def apply_flex_shard_to_decoder(
             ``relayout_owned_buckets``). Until then the bucket shards like the
             others, so initialization matches FSDP2's. Patterns covering the
             whole block outside the routed experts leave the block one bucket.
+        full_graph: Prepare the buckets for capturing the whole model as one
+            graph (``parallelism.flex_shard_full_graph``): an FSDP2 group of
+            several modules becomes a bucket named by their parameters, with the
+            same parameters, placements and order.
     """
     # flex_shard is an optional dependency, needed only for this backend.
     # pyrefly: ignore [missing-import]
@@ -201,6 +206,20 @@ def apply_flex_shard_to_decoder(
     def add_module_bucket(module_fqns: list[str], reshard_after_forward: bool) -> int:
         for fqn in module_fqns:
             bucketed_params.update(model.get_submodule(fqn).parameters())
+        if full_graph and len(module_fqns) > 1:
+            # flex_shard hooks a bucket of several modules eagerly only. Named by
+            # their parameters, the bucket hooks the decoder, which graph capture
+            # traces, and keeps FSDP2's parameters, placements and order.
+            return add_bucket(
+                [
+                    f"{fqn}.{name}"
+                    for fqn in module_fqns
+                    for name, _ in model.get_submodule(fqn).named_parameters(
+                        remove_duplicate=False
+                    )
+                ],
+                reshard_after_forward,
+            )
         return add_bucket(module_fqns, reshard_after_forward)
 
     # Bucket indices, for the explicit prefetch under expert parallelism.
