@@ -24,9 +24,9 @@ The public API is exported from `torchtitan.distributed.flex_shard`:
   selected rank for the compute phase.
 - `BucketConfig` groups and orders parameters by fully qualified name for
   packed redistribution and communication-compute overlap.
-- `redistribution_mesh_axes(fqn, parameter, compute_layout)` returns the
-  storage mesh axes a parameter's transport spans, or `()` when its storage
-  already holds complete compute matrices. It does not communicate.
+- `DistMuon(..., redistribution_meshes=...)` takes caller-created 1D process
+  groups and gives each bucket the one whose ranks match the storage axes its
+  transport spans.
 - `BlockShard.block_sizes` is a nonempty tuple describing a repeating sequence
   of independently shardable block sizes. Use `(R,)` for uniform blocks.
   For example, `(128, 64)` partitions
@@ -54,8 +54,8 @@ The public API is exported from `torchtitan.distributed.flex_shard`:
 
 Storage placements describe persistent ownership only; they do not define
 Muon matrix boundaries. Flat matrix-batch compute may use `BlockShard` on one
-or more non-unit mesh axes. Callers supply a mesh combining those axes into
-one optimizer transport group. FlexShard routes complete matrices across it and restores the
+or more non-unit mesh axes. Callers pass a 1D process group over those axes
+in `redistribution_meshes`. FlexShard routes complete matrices across it and restores the
 original DTensor storage layout after the update. This supports combined DP
 and TP storage, including the strided shards produced when TP and FSDP shard
 the same tensor dimension. Non-transport mesh axes retain their storage
@@ -69,39 +69,40 @@ into one transport group; complete matrices are assigned across that group.
 For example, expert storage `Shard(0), Shard(1)` on DP/TP preserves each DP
 rank's expert range while TP redistributes matrix rows to whole-expert compute.
 
-### Transport meshes
+### Redistribution process groups
 
-FlexShard never creates process groups. A bucket whose transport spans one
-storage axis uses that axis's existing group when `BucketConfig.mesh` is
-`None`. A transport spanning several axes needs an explicit 1D mesh over the
-same ranks in storage order, named by joining the axes.
-
-Which axes a transport spans follows from FlexShard's resolution rules (e.g.
-`Owned` on a replicated axis still transports over it, and `BlockShard` rows
-already aligned with storage do not), so callers cannot derive them on their
-own. `redistribution_mesh_axes` resolves the axes with the same rules
-`DistMuon`'s planner uses, so the caller's mesh always matches the plan. It
-reads metadata only:
+FlexShard never creates process groups. For each bucket, `DistMuon` resolves
+the storage axes its transport spans (e.g. `Owned` on a replicated axis still
+transports over it, and `BlockShard` rows already aligned with storage do
+not) and uses the `redistribution_meshes` entry whose ranks equal those axes'
+ranks in storage order; mesh names are not read. Without a match, a
+single-axis transport reuses its storage group and a combined transport
+raises `ValueError`. Two matches also raise.
 
 ```python
-axes = redistribution_mesh_axes("matrix", parameter, compute_layout)  # ("dp_shard", "tp")
-ranks = parameter.device_mesh[axes].mesh.flatten().tolist()
+# (dp_shard=2, tp=2) storage, compute {"dp_shard": Owned(), "tp": Owned()}:
+# the transport spans both axes, so it needs their ranks as one group.
+ranks = parameter.device_mesh["dp_shard", "tp"].mesh.flatten().tolist()
 group = dist.new_group(ranks)  # collective over WORLD
 mesh = DeviceMesh.from_group(
-    group,
-    parameter.device_mesh.device_type,
-    mesh=torch.tensor(ranks),
-    mesh_dim_names=("_".join(axes),),
+    group, parameter.device_mesh.device_type, mesh=torch.tensor(ranks)
 )
-bucket = BucketConfig(patterns=("matrix",), mesh=mesh)
+optimizer = DistMuon(
+    param_groups,
+    compute_sharding_by_fqn=compute_sharding_by_fqn,
+    bucket_configs=bucket_configs,
+    redistribution_meshes=[mesh],
+)
 ```
 
-`dist.new_group` must be called by every rank in the same order. When ranks
-need different transports (e.g. pipeline stages), create the union of all
-ranks' groups on every rank, as `build_transport_meshes` does.
+`dist.new_group` must be called by every rank in the same order, so create
+every group on every rank, including groups a pipeline stage does not use.
+A group with the same ranks as a storage axis gives that axis's transports
+their own communicator.
 
-TorchTitan's `DistMuon` wrapper builds these meshes for every bucket with
-`torchtitan.distributed.utils.build_transport_meshes`.
+In TorchTitan, `ParallelismContext.get_redistribution_meshes` creates these
+groups once on every rank (with the NCCL CTA cap, as dedicated copies of the
+storage axes too), and the `DistMuon` wrapper passes them in.
 
 Several mesh axes may shard the same tensor dimension. By default they apply
 in storage-mesh order; `shard_order_by_tensor_dim` states a different order,

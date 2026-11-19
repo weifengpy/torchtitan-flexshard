@@ -114,16 +114,18 @@ def test_optim_builds_owned_components(enable_accelerator_graph: bool) -> None:
         "torchtitan.components.optim.optim.accelerator_graphs_supported",
         return_value=enable_accelerator_graph,
     ):
+        parallelism_context = MagicMock()
         optim = Optim(
             config,
             model_parts=[model],
-            parallelism_context=MagicMock(),
+            parallelism_context=parallelism_context,
             training_steps=10,
             pp_has_last_stage=True,
         )
 
     optimizer_config.build.assert_called_once_with(
         model_parts=[model],
+        parallelism_context=parallelism_context,
         enable_accelerator_graph=enable_accelerator_graph,
     )
     config.lr_scheduler.build.assert_called_once_with(
@@ -172,16 +174,18 @@ def test_optim_accelerator_graph_falls_back_for_unsupported_device(
         "torchtitan.components.optim.optim.accelerator_graphs_supported",
         return_value=runtime_supported,
     ), patch("torchtitan.components.optim.optim.wrap_with_accelerator_graph") as wrap:
+        parallelism_context = MagicMock()
         optim = Optim(
             config,
             model_parts=[model],
-            parallelism_context=MagicMock(),
+            parallelism_context=parallelism_context,
             training_steps=10,
             pp_has_last_stage=True,
         )
 
     optimizer_build.assert_called_once_with(
         model_parts=[model],
+        parallelism_context=parallelism_context,
         enable_accelerator_graph=False,
     )
     gradient_clipper_config.build.assert_called_once_with()

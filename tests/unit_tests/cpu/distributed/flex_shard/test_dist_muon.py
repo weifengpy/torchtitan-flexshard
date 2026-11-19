@@ -4,13 +4,14 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""CPU checks for DistMuon DP x TP layouts and pipeline transport creation."""
+"""CPU checks for DistMuon DP x TP layouts and pipeline group creation."""
 
 from datetime import timedelta
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
-from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import distribute_tensor, Shard
 from torch.distributed.tensor.placement_types import _StridedShard
 from torch.testing._internal.distributed._tensor.common_dtensor import (
@@ -32,7 +33,15 @@ from torchtitan.distributed.flex_shard.dist_muon import (
     _adjust_muon_learning_rate,
     DistMuon,
 )
-from torchtitan.distributed.utils import build_transport_meshes
+from torchtitan.distributed.parallelism_context import ParallelismContext
+
+
+def _flattened_group(mesh: DeviceMesh) -> DeviceMesh:
+    """Return one process group over all of ``mesh``'s ranks, in storage order."""
+    ranks = mesh.mesh.flatten().tolist()
+    return DeviceMesh.from_group(
+        dist.new_group(ranks), mesh.device_type, mesh=torch.tensor(ranks)
+    )
 
 
 class TestDistMuonTensorParallelCPU(DTensorTestBase):
@@ -82,9 +91,7 @@ class TestDistMuonTensorParallelCPU(DTensorTestBase):
         values = torch.arange(36).reshape(12, 3).float().div_(41)
         gradient = values.mul(0.37).add(0.2).sin()
         lr = 0.03
-        (transport_mesh,) = build_transport_meshes(
-            [(mesh, ("dp_shard", "tp"))], max_ctas=None
-        )
+        transport_mesh = _flattened_group(mesh)
         for storage_placements in (
             (Shard(0), Shard(0)),
             (_StridedShard(0, split_factor=2), Shard(0)),
@@ -103,9 +110,8 @@ class TestDistMuonTensorParallelCPU(DTensorTestBase):
                         compute_dtype=torch.bfloat16,
                     )
                 },
-                bucket_configs=(
-                    BucketConfig(patterns=("matrix",), mesh=transport_mesh),
-                ),
+                bucket_configs=(BucketConfig(patterns=("matrix",)),),
+                redistribution_meshes=(transport_mesh,),
                 lr=lr,
                 weight_decay=0,
                 momentum=0,
@@ -166,21 +172,27 @@ class TestDistMuonUnevenPipelineCPU(DTensorTestBase):
         return "cpu"
 
     @with_comms
-    def test_uneven_pipeline_transport_creation_and_muon_parity(self):
+    def test_uneven_pipeline_group_creation_and_muon_parity(self):
         """Stages with different buckets and storage meshes create every group.
 
         Stage 0 holds only a dense matrix on (dp_shard, tp); stage 1 holds only
-        experts on (edp_shard, ep), so neither has the other's storage mesh.
+        experts on (edp_shard, ep), so neither needs the other's groups.
+        ParallelismContext creates the combined (dp_shard, tp) groups of both
+        stages on every rank.
         """
-        world_mesh = init_device_mesh(
-            "cpu", (self.world_size,), mesh_dim_names=("world",)
-        )
-        dense_mesh = world_mesh._unflatten(
-            0, (2, 2, 2), mesh_dim_names=("pp", "dp_shard", "tp")
-        )["dp_shard", "tp"]
-        expert_mesh = world_mesh._unflatten(
-            0, (2, 2, 2), mesh_dim_names=("pp", "edp_shard", "ep")
-        )["edp_shard", "ep"]
+        with patch("torchtitan.distributed.parallelism_context.device_type", "cpu"):
+            parallelism_context = ParallelismContext(
+                dp_replicate=1,
+                dp_shard=2,
+                cp=1,
+                tp=2,
+                pp=2,
+                ep=2,
+                world_size=self.world_size,
+                enable_sequence_parallel=False,
+            )
+            dense_mesh = parallelism_context.get_mesh(["dp_shard", "tp"])
+            expert_mesh = parallelism_context.get_mesh(["edp_shard", "ep"])
         name = "dense" if self.rank < 4 else "experts"
         mesh = dense_mesh if name == "dense" else expert_mesh
         value = (
@@ -215,9 +227,10 @@ class TestDistMuonUnevenPipelineCPU(DTensorTestBase):
             nesterov=True,
             ns_steps=2,
         )
-        optimizer = OptimizersContainer.Config(optimizers=[muon]).build(
-            model_parts=[model]
-        )
+        with patch("torchtitan.distributed.parallelism_context.device_type", "cpu"):
+            optimizer = OptimizersContainer.Config(optimizers=[muon]).build(
+                model_parts=[model], parallelism_context=parallelism_context
+            )
         # Nonmember ranks can skip native first-use group creation without an
         # immediate Gloo hang. The next WORLD group exposes the desynchronization.
         dist.barrier()

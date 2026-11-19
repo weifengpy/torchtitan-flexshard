@@ -48,6 +48,7 @@ class TestMuonPlanConstruction(unittest.TestCase):
         parameter: torch.nn.Parameter,
         *,
         bucket_config: BucketConfig,
+        redistribution_meshes: tuple[DeviceMesh, ...] = (),
     ) -> DistMuon:
         with patch.object(_BucketedRedistributionRuntime, "reserve_buffers"):
             return DistMuon(
@@ -64,6 +65,7 @@ class TestMuonPlanConstruction(unittest.TestCase):
                     )
                 },
                 bucket_configs=[bucket_config],
+                redistribution_meshes=redistribution_meshes,
             )
 
     def test_fixed_work_changes_placement_and_plan_reuse(self):
@@ -126,40 +128,38 @@ class TestMuonPlanConstruction(unittest.TestCase):
             [((1, 4, 4), 0), ((1, 2, 4), 16)],
         )
 
-    def test_bucket_mesh_requires_matching_named_axis(self):
+    def test_redistribution_mesh_is_selected_by_rank_order(self):
         mesh, parameter = self._make_1d_parameter()
-        wrong_axis_mesh = DeviceMesh.from_group(
-            [mesh.get_group()],
-            "cpu",
-            mesh=mesh.mesh,
-            mesh_dim_names=("other",),
-        )
 
-        with self.assertRaisesRegex(ValueError, "missing redistribution axis"):
-            self._build_single_parameter_optimizer(
-                parameter,
-                bucket_config=BucketConfig(
-                    patterns=(self._FQN,),
-                    mesh=wrong_axis_mesh,
-                ),
+        def group_mesh(ranks: torch.Tensor) -> DeviceMesh:
+            return DeviceMesh.from_group(
+                [mesh.get_group()], "cpu", mesh=ranks, mesh_dim_names=("any_name",)
             )
 
-    def test_bucket_mesh_requires_matching_rank_order(self):
+        same_order, reversed_order = group_mesh(mesh.mesh), group_mesh(
+            mesh.mesh.flip(0)
+        )
+        optimizer = self._build_single_parameter_optimizer(
+            parameter,
+            bucket_config=BucketConfig(patterns=(self._FQN,)),
+            redistribution_meshes=(reversed_order, same_order),
+        )
+        # Names are not read; a group with another rank order is not this
+        # bucket's transport.
+        self.assertIs(optimizer._specs[0].mesh, same_order)
+
+    def test_ambiguous_redistribution_meshes_raise(self):
         mesh, parameter = self._make_1d_parameter()
-        reversed_mesh = DeviceMesh.from_group(
-            [mesh.get_group()],
-            "cpu",
-            mesh=mesh.mesh.flip(0),
-            mesh_dim_names=("dp_shard",),
+        copies = tuple(
+            DeviceMesh.from_group(mesh.get_group(), "cpu", mesh=mesh.mesh)
+            for _ in range(2)
         )
 
-        with self.assertRaisesRegex(ValueError, "does not match"):
+        with self.assertRaisesRegex(ValueError, "several redistribution_meshes"):
             self._build_single_parameter_optimizer(
                 parameter,
-                bucket_config=BucketConfig(
-                    patterns=(self._FQN,),
-                    mesh=reversed_mesh,
-                ),
+                bucket_config=BucketConfig(patterns=(self._FQN,)),
+                redistribution_meshes=copies,
             )
 
 

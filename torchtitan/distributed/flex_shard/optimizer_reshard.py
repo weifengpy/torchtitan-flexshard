@@ -288,18 +288,13 @@ class ComputeLayout:
 class BucketConfig:
     """Ordered optimizer-work bucket selected by canonical FQN patterns.
 
-    ``mesh`` may override the process groups used for redistribution. It must
-    have the same ranks in the same order as the selected storage axes. For
-    one transport axis, its name must match and a storage-shaped mesh is also
-    accepted. For multiple axes, supply a 1D mesh named by joining the axis
-    names, for example ``dp_shard_tp``. The caller creates and owns these
-    communicators. ``None`` reuses the storage group for a single transport
-    axis; combined transports require an explicit mesh.
+    The bucket's process group is not configured here: ``DistMuon`` picks it
+    from its ``redistribution_meshes`` by the ranks the bucket's transport
+    spans.
     """
 
     patterns: tuple[str, ...]
     name: str = ""
-    mesh: DeviceMesh | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "patterns", tuple(self.patterns))

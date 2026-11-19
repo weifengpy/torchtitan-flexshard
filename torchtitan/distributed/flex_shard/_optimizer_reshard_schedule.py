@@ -36,6 +36,7 @@ def _bind_bucket_configs(
     configs: Sequence[BucketConfig],
     items: Sequence[_ItemT],
     *,
+    redistribution_meshes: Sequence[DeviceMesh],
     get_fqn: Callable[[_ItemT], str],
     get_storage_dtensor: Callable[[_ItemT], DTensor],
     requires_redistribution: Callable[[_ItemT], bool],
@@ -43,10 +44,14 @@ def _bind_bucket_configs(
 ) -> tuple[_BucketSpec, ...]:
     """Bind configs after each item's redistribution requirement is resolved.
 
-    Redistributed items determine the communication axes. An explicit bucket
-    mesh may replace their process group while preserving the layout. An
-    entirely local bucket remains mesh-free.
+    Redistributed items determine the communication axes. The bucket uses the
+    ``redistribution_meshes`` entry whose ranks equal those axes' ranks in
+    storage order; with no such entry, a single axis reuses its storage group
+    and several axes raise. An entirely local bucket remains mesh-free.
     """
+    for mesh in redistribution_meshes:
+        if mesh.ndim != 1:
+            raise ValueError("redistribution_meshes must be one-dimensional")
     specs = []
     for config in configs:
         matched_items = tuple(
@@ -105,46 +110,28 @@ def _bind_bucket_configs(
                 f"bucket {config.name!r} requires heterogeneous transport groups; "
                 "split its BucketConfig patterns"
             )
-        if config.mesh is not None:
-            configured_axis_names = config.mesh.mesh_dim_names
-            if configured_axis_names == ("_".join(transport_axis_names),):
-                configured_transport_mesh = config.mesh
-            elif configured_axis_names is None or any(
-                axis_name not in configured_axis_names
-                for axis_name in transport_axis_names
-            ):
-                raise ValueError(
-                    f"bucket {config.name!r} mesh is missing redistribution axis "
-                    f"names {transport_axis_names!r}"
-                )
-            else:
-                configured_transport_mesh = config.mesh[
-                    transport_axis_names[0]
-                    if len(transport_axis_names) == 1
-                    else transport_axis_names
-                ]
-            if configured_transport_mesh.ndim > 1:
-                raise ValueError(
-                    f"bucket {config.name!r} requires a 1D mesh for its combined "
-                    f"transport axes {transport_axis_names!r}; flatten it before "
-                    "constructing DistMuon"
-                )
-            if not torch.equal(
-                configured_transport_mesh.mesh.flatten(),
-                storage_transport_ranks.flatten(),
-            ):
-                raise ValueError(
-                    f"bucket {config.name!r} mesh for axes {transport_axis_names!r} "
-                    "does not match the parameter storage mesh layout"
-                )
-            selected_transport_mesh = configured_transport_mesh
-        else:
-            if len(transport_axis_names) != 1:
-                raise ValueError(
-                    f"bucket {config.name!r} requires an explicit BucketConfig.mesh "
-                    f"for combined transport axes {transport_axis_names!r}"
-                )
+        transport_ranks = storage_transport_ranks.flatten()
+        matching_meshes = [
+            mesh
+            for mesh in redistribution_meshes
+            if torch.equal(mesh.mesh, transport_ranks)
+        ]
+        if len(matching_meshes) > 1:
+            raise ValueError(
+                f"bucket {config.name!r}: several redistribution_meshes cover "
+                f"ranks {transport_ranks.tolist()} of storage axes "
+                f"{transport_axis_names!r}; pass one group per rank set"
+            )
+        if matching_meshes:
+            (selected_transport_mesh,) = matching_meshes
+        elif len(transport_axis_names) == 1:
             selected_transport_mesh = storage_mesh[transport_axis_names[0]]
+        else:
+            raise ValueError(
+                f"bucket {config.name!r} transports over storage axes "
+                f"{transport_axis_names!r}; redistribution_meshes must include a "
+                f"1D mesh over ranks {transport_ranks.tolist()} in this order"
+            )
         specs.append(config._bind(selected_transport_mesh))
     return tuple(specs)
 

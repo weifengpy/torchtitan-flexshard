@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import math
 import os
 import socket
 
@@ -23,6 +24,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
+import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
@@ -96,6 +98,53 @@ def unfold_dp_axes(axes: Iterable[MeshAxisName | str]) -> list[str]:
     ]
 
 
+def _rank_groups(
+    mesh: DeviceMesh, axis_names: tuple[str, ...]
+) -> tuple[tuple[int, ...], ...]:
+    """Return the ranks along ``axis_names`` for every other coordinate.
+
+    ``mesh`` must hold every rank, like the meshes unflattened from the world
+    mesh. Each group lists its ranks in storage (row-major) order.
+    """
+    mesh_axis_names = mesh.mesh_dim_names
+    assert mesh_axis_names is not None
+    group_axes = [mesh_axis_names.index(name) for name in axis_names]
+    other_axes = [axis for axis in range(mesh.ndim) if axis not in group_axes]
+    group_size = math.prod(mesh.mesh.shape[axis] for axis in group_axes)
+    rank_groups = mesh.mesh.permute(*other_axes, *group_axes).reshape(-1, group_size)
+    return tuple(tuple(ranks) for ranks in rank_groups.tolist())
+
+
+def _new_redistribution_groups(
+    rank_groups: tuple[tuple[int, ...], ...],
+    *,
+    name: str,
+    backend: str | None,
+    pg_options: dist.ProcessGroupNCCL.Options | None,
+) -> DeviceMesh:
+    """Create every group on every rank; return this rank's as a 1D mesh."""
+    rank = dist.get_rank()
+    own_mesh = None
+    for ranks in rank_groups:
+        # Collective over WORLD: every rank creates every group, in order.
+        group = dist.new_group(
+            list(ranks),
+            backend=backend,
+            pg_options=pg_options,
+            group_desc=f"redistribution_{name}",
+        )
+        if rank in ranks:
+            assert isinstance(group, dist.ProcessGroup)
+            own_mesh = DeviceMesh.from_group(
+                group,
+                device_type,
+                mesh=torch.tensor(ranks),
+                mesh_dim_names=(name,),
+            )
+    assert own_mesh is not None
+    return own_mesh
+
+
 @dataclass
 class ParallelismContext:
     """Parallelism degrees and the device meshes derived from them."""
@@ -118,6 +167,10 @@ class ParallelismContext:
         default_factory=dict, init=False, repr=False
     )
     _global_meshes: dict[str, DeviceMesh] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    # Optimizer redistribution groups, keyed by their NCCL CTA cap.
+    _redistribution_meshes: dict[int | None, tuple[DeviceMesh, ...]] = field(
         default_factory=dict, init=False, repr=False
     )
     _world_mesh: DeviceMesh | None = field(default=None, init=False, repr=False)
@@ -489,6 +542,84 @@ class ParallelismContext:
                 f"Ensure the corresponding parallelism axes are {enabled_str}."
             )
         return mesh
+
+    def get_redistribution_meshes(
+        self, *, max_nccl_ctas: int | None
+    ) -> tuple[DeviceMesh, ...]:
+        """Return this rank's process groups for optimizer redistribution.
+
+        FlexShard's ``DistMuon`` picks, for each bucket, the group whose ranks
+        match the storage axes its transport spans, and otherwise reuses the
+        storage group of a single axis. This builds the groups the storage
+        meshes lack:
+
+        - With TP, ``(dp_shard, tp)``, plus ``(dp_shard, cp, tp)`` under CP:
+          the ranks of FSDP's flattened ``dp_shard_cp`` storage axis with TP.
+        - With ``max_nccl_ctas``, the groups above and copies of the single
+          storage axes (``dp_shard``, ``(dp_shard, cp)``, ``tp``, ``edp_shard``,
+          ``ep``) use dedicated NCCL communicators capped at that many CTAs, so
+          FSDP keeps its own communicators.
+
+        Each group family covers every coordinate of the remaining mesh axes,
+        and every rank creates every group in the same order, so pipeline
+        stages that need different groups stay consistent without
+        communication. The groups are not registered on any device mesh, so
+        DTensor never uses them. Results are cached per ``max_nccl_ctas``;
+        every rank must make the same calls in the same order.
+        """
+        if max_nccl_ctas in self._redistribution_meshes:
+            return self._redistribution_meshes[max_nccl_ctas]
+        if not self._global_meshes:
+            self.build_mesh()
+
+        backend = pg_options = None
+        if max_nccl_ctas is not None:
+            default_backend = dist.get_backend()
+            if dist.Backend.NCCL not in default_backend:
+                raise ValueError(
+                    f"max_nccl_ctas requires NCCL, got {default_backend!r}"
+                )
+            backend = dist.Backend.NCCL
+            pg_options = dist.ProcessGroupNCCL.Options()
+            pg_options.config.max_ctas = max_nccl_ctas
+            # Keep redistribution channels independent from the storage groups.
+            pg_options.config.split_share = 0  # pyrefly: ignore [missing-attribute]
+
+        dense = self._global_meshes["dense"]
+        sparse = self._global_meshes["sparse"]
+        families: list[tuple[DeviceMesh, tuple[str, ...]]] = []
+        if self.tp > 1:
+            families.append((dense, ("dp_shard", "tp")))
+            if self.cp > 1:
+                families.append((dense, ("dp_shard", "cp", "tp")))
+        if max_nccl_ctas is not None:
+            families += [
+                (dense, ("dp_shard",)),
+                (dense, ("dp_shard", "cp")),
+                (dense, ("tp",)),
+            ]
+            if self.ep > 1:
+                families += [(sparse, ("edp_shard",)), (sparse, ("ep",))]
+
+        meshes = []
+        # Families with the same groups (e.g. dp_shard and (dp_shard, cp) when
+        # cp is 1) are created once, or DistMuon could not pick between them.
+        created_rank_groups = set()
+        for mesh, axis_names in families:
+            rank_groups = _rank_groups(mesh, axis_names)
+            if len(rank_groups[0]) == 1 or rank_groups in created_rank_groups:
+                continue
+            created_rank_groups.add(rank_groups)
+            meshes.append(
+                _new_redistribution_groups(
+                    rank_groups,
+                    name="_".join(axis_names),
+                    backend=backend,
+                    pg_options=pg_options,
+                )
+            )
+        self._redistribution_meshes[max_nccl_ctas] = tuple(meshes)
+        return self._redistribution_meshes[max_nccl_ctas]
 
     @contextlib.contextmanager
     def activate_spmd(self, *, typechecking: bool = False) -> Iterator[None]:

@@ -47,11 +47,31 @@ from torchtitan.distributed.flex_shard.dist_muon import (
     _adjust_muon_learning_rate,
     DistMuon,
 )
-
-from torchtitan.distributed.utils import build_transport_meshes
+from torchtitan.distributed.parallelism_context import ParallelismContext
 
 
 pytestmark = pytest.mark.multi_gpu
+
+
+def _flattened_group(mesh: DeviceMesh) -> DeviceMesh:
+    """Return one process group over all of ``mesh``'s ranks, in storage order."""
+    ranks = mesh.mesh.flatten().tolist()
+    return DeviceMesh.from_group(
+        dist.new_group(ranks), mesh.device_type, mesh=torch.tensor(ranks)
+    )
+
+
+def _data_parallel_context(world_size: int) -> ParallelismContext:
+    return ParallelismContext(
+        dp_replicate=1,
+        dp_shard=world_size,
+        cp=1,
+        tp=1,
+        pp=1,
+        ep=1,
+        world_size=world_size,
+        enable_sequence_parallel=False,
+    )
 
 
 @unittest.skipUnless(torch.cuda.device_count() >= 2, "requires two CUDA devices")
@@ -80,6 +100,10 @@ class TestDistMuon(DTensorTestBase):
                 (Replicate(), Shard(0)),
             )
         )
+        parallelism_context = _data_parallel_context(self.world_size)
+        # dp_shard and its (dp_shard, cp) copy have the same ranks at cp=1, so
+        # one capped group remains.
+        (capped_mesh,) = parallelism_context.get_redistribution_meshes(max_nccl_ctas=8)
         optimizer = ConfigurableDistMuon.Config(
             pattern=".*",
             compute_sharding_by_fqn={
@@ -89,8 +113,12 @@ class TestDistMuon(DTensorTestBase):
             },
             bucket_configs=[BucketConfig(patterns=("matrix",))],
             max_nccl_ctas_for_comms=8,
-        ).build(params=[{"params": [parameter], "param_names": ["matrix"]}])
+        ).build_for_param_group(
+            {"params": [parameter], "param_names": ["matrix"]},
+            parallelism_context=parallelism_context,
+        )
         redistribution_group = optimizer._bucket_plans[0].group.process_group
+        self.assertIs(redistribution_group, capped_mesh.get_group())
         redistribution_backend = redistribution_group._get_backend(
             torch.device(self.device_type, self.rank)
         )
@@ -150,9 +178,9 @@ class TestDistMuon(DTensorTestBase):
             (1, self.world_size),
             mesh_dim_names=("dp_replicate", "dp_shard"),
         )
-        (redistribution_mesh,) = build_transport_meshes(
-            [(mesh, ("dp_shard",))], max_ctas=8
-        )
+        (redistribution_mesh,) = _data_parallel_context(
+            self.world_size
+        ).get_redistribution_meshes(max_nccl_ctas=8)
         redistribution_group = redistribution_mesh.get_group()
         device = torch.device(self.device_type, self.rank)
 
@@ -196,9 +224,9 @@ class TestDistMuon(DTensorTestBase):
                     BucketConfig(
                         patterns=("layers.0.*",),
                         name="layers.0",
-                        mesh=redistribution_mesh,
                     )
                 ],
+                redistribution_meshes=(redistribution_mesh,),
                 lr=lr,
                 weight_decay=weight_decay,
                 momentum=0.8,
@@ -802,14 +830,7 @@ class TestDistMuonTensorParallelCudaGraph(DTensorTestBase):
                 placements[fqn],
             )
 
-        transport_axes = dist_muon_module.redistribution_mesh_axes(
-            "layers.0.whole",
-            parameters["layers.0.whole"],
-            ComputeLayout(shardings_by_mesh_axis={"dp_shard": Owned(), "tp": Owned()}),
-        )
-        (transport_mesh,) = build_transport_meshes(
-            [(mesh, transport_axes)], max_ctas=None
-        )
+        transport_mesh = _flattened_group(mesh)
         optimizer = DistMuon(
             [
                 {
@@ -838,12 +859,10 @@ class TestDistMuonTensorParallelCudaGraph(DTensorTestBase):
                 ),
             },
             bucket_configs=[
-                BucketConfig(
-                    patterns=("layers.0.per_head", "layers.0.whole"),
-                    mesh=transport_mesh,
-                ),
+                BucketConfig(patterns=("layers.0.per_head", "layers.0.whole")),
                 BucketConfig(patterns=("layers.0.experts",)),
             ],
+            redistribution_meshes=(transport_mesh,),
             lr=lr,
             weight_decay=weight_decay,
             momentum=0.0,
@@ -1034,22 +1053,17 @@ class TestDistMuonMatchesUnshardedMuon(DTensorTestBase):
         # One bucket per parameter keeps every compute input unshared, so it is
         # the exact, GEMM-schedule-independent reference for the shared bucket.
         separate_parameters = make_parameters()
-        transport_axes = dist_muon_module.redistribution_mesh_axes(
+        transport_axes = dist_muon_module._resolve_storage_to_compute_transition(
             "b_whole", parameters["b_whole"], owned
-        )
-        (transport_mesh,) = build_transport_meshes(
-            [(mesh, transport_axes)], max_ctas=None
-        )
+        ).redistribution_storage_mesh_axes
+        transport_mesh = _flattened_group(mesh)
         dense_patterns = ("a_replicated", "b_whole", "c_heads")
 
-        def build(dense_mesh, parameters=parameters, separate=False):
+        def build(redistribution_meshes, parameters=parameters, separate=False):
             dense_buckets = (
-                [
-                    BucketConfig(patterns=(fqn,), mesh=dense_mesh)
-                    for fqn in dense_patterns
-                ]
+                [BucketConfig(patterns=(fqn,)) for fqn in dense_patterns]
                 if separate
-                else [BucketConfig(patterns=dense_patterns, mesh=dense_mesh)]
+                else [BucketConfig(patterns=dense_patterns)]
             )
             return DistMuon(
                 [
@@ -1060,11 +1074,12 @@ class TestDistMuonMatchesUnshardedMuon(DTensorTestBase):
                 ],
                 compute_sharding_by_fqn=compute_sharding_by_fqn,
                 bucket_configs=[*dense_buckets, BucketConfig(patterns=("d_experts",))],
+                redistribution_meshes=redistribution_meshes,
                 **hyperparameters,
             )
 
         # FlexShard only consumes caller-created groups: neither the
-        # missing-mesh error nor construction may create one.
+        # missing-group error nor construction may create one.
         caller_owns_groups = AssertionError("caller owns groups")
         with (
             mock.patch.object(DeviceMesh, "_flatten", side_effect=caller_owns_groups),
@@ -1072,11 +1087,13 @@ class TestDistMuonMatchesUnshardedMuon(DTensorTestBase):
             mock.patch.object(dist, "split_group", side_effect=caller_owns_groups),
         ):
             if len(transport_axes) > 1:
-                with self.assertRaisesRegex(ValueError, "explicit BucketConfig.mesh"):
-                    build(None)
-            optimizer = build(transport_mesh)
+                with self.assertRaisesRegex(
+                    ValueError, "redistribution_meshes must include"
+                ):
+                    build(())
+            optimizer = build((transport_mesh,))
             separate_optimizer = build(
-                transport_mesh, parameters=separate_parameters, separate=True
+                (transport_mesh,), parameters=separate_parameters, separate=True
             )
 
         def split(fqn, tensor):

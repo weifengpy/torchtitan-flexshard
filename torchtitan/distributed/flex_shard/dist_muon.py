@@ -16,6 +16,7 @@ from typing import Any, cast, Literal, NoReturn, overload
 
 import torch
 from torch import Tensor
+from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.tensor._utils import _compute_local_shape_and_global_offset
 from torch.distributed.tensor.placement_types import _StridedShard
@@ -54,26 +55,7 @@ from .optimizer_reshard import (
 
 __all__ = [
     "DistMuon",
-    "redistribution_mesh_axes",
 ]
-
-
-def redistribution_mesh_axes(
-    fqn: str, param: DTensor, compute_layout: ComputeLayout
-) -> tuple[str, ...]:
-    """Return the ordered storage-axis names needed for this Muon transition.
-
-    This construction-time query resolves the transport axes with the same
-    rules as DistMuon's planner, without allocating buffers or creating
-    communicators. An empty tuple means storage already contains complete
-    compute matrices.
-    """
-    resolved = _resolve_storage_to_compute_transition(fqn, param, compute_layout)
-    mesh_axis_names = param.device_mesh.mesh_dim_names
-    assert mesh_axis_names is not None
-    return tuple(
-        mesh_axis_names[axis] for axis in resolved.redistribution_storage_mesh_axes
-    )
 
 
 _NSCoefficients = tuple[float, float, float]
@@ -152,6 +134,7 @@ def _initialize_dist_muon(
     *,
     compute_sharding_by_fqn: Mapping[str, ComputeLayout],
     bucket_configs: Sequence[BucketConfig],
+    redistribution_meshes: Sequence[DeviceMesh],
 ) -> None:
     """Initialize FlexShard for one newly constructed DistMuon.
 
@@ -175,6 +158,7 @@ def _initialize_dist_muon(
     optimizer._specs = _bind_bucket_configs(
         tuple(bucket_configs),
         compute_layouts,
+        redistribution_meshes=tuple(redistribution_meshes),
         get_fqn=lambda layout: layout.fqn,
         get_storage_dtensor=lambda layout: layout.param,
         requires_redistribution=lambda layout: (not layout.storage_is_compute_ready),
@@ -202,10 +186,12 @@ class DistMuon(Optimizer):
     have a layout-compatible DTensor gradient before each rank enters
     ``step()``.
 
-    Callers construct dedicated transport meshes and supply them through
-    ``BucketConfig.mesh``. A single-axis bucket without an explicit mesh reuses
-    its storage group. Combined transports require an explicit 1D mesh with
-    the same storage ranks and order. Construction and checkpoint loading reuse
+    Callers create the redistribution process groups and pass them as
+    ``redistribution_meshes``: 1D meshes, each over the ranks of some storage
+    axes in storage order. For every bucket, DistMuon resolves the storage
+    axes its transport spans and uses the mesh whose ranks match; a
+    single-axis transport without one reuses its storage group, and a combined
+    transport without one raises. Construction and checkpoint loading reuse
     the bound groups; DistMuon does not create communicators or choose their
     initialization options.
 
@@ -244,6 +230,7 @@ class DistMuon(Optimizer):
         *,
         compute_sharding_by_fqn: Mapping[str, ComputeLayout],
         bucket_configs: Sequence[BucketConfig],
+        redistribution_meshes: Sequence[DeviceMesh] = (),
         lr: float = 1e-3,
         weight_decay: float = 0.1,
         momentum: float = 0.95,
@@ -274,6 +261,7 @@ class DistMuon(Optimizer):
             self,
             compute_sharding_by_fqn=compute_sharding_by_fqn,
             bucket_configs=bucket_configs,
+            redistribution_meshes=redistribution_meshes,
         )
 
     @staticmethod

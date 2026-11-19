@@ -102,6 +102,23 @@ On a Transformer block those views mean:
 
 Same eight GPUs in every case. Raising EP does not grow `world_size`.
 
+## Optimizer redistribution groups
+
+`get_redistribution_meshes` builds the process groups FlexShard's `DistMuon`
+redistributes over when no storage axis provides them, and never registers them
+on a mesh, so DTensor does not use them. In the worked example (TP on), each
+rank gets:
+
+| Group | Ranks | Used by |
+|-------|-------|---------|
+| `(dp_shard, tp)` | `(0,1,4,5)` and `(2,3,6,7)` | matrices stored on `(dp_shard, tp)` |
+| `(dp_shard, cp, tp)` | `(0,1,2,3,4,5,6,7)` | matrices stored on `(dp_shard_cp, tp)` |
+
+With `max_nccl_ctas`, the groups use dedicated NCCL communicators capped at that
+many CTAs, and capped copies of `dp_shard`, `(dp_shard, cp)`, `tp`,
+`edp_shard` and `ep` are added. Every rank creates every group in the same
+order, including the groups of other pipeline stages.
+
 ## Saving the layout
 
 Set `config.parallelism.save_parallelism_folder = "parallelism"` in the recipe

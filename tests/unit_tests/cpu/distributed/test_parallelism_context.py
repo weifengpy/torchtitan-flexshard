@@ -25,6 +25,7 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
     DTensorTestBase,
     with_comms,
 )
+from torch.testing._internal.distributed.fake_pg import FakeStore
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed.fsdp import apply_fsdp_to_decoder
 from torchtitan.distributed.parallelism_context import (
@@ -829,6 +830,61 @@ class TestDenseStorageAxes(DTensorTestBase):
             self.assertNotIn("fsdp", axes)
             self.assertIn("dp", axes)
             self.assertIn("dp_shard", axes)
+
+
+class TestRedistributionMeshes(unittest.TestCase):
+    """Optimizer redistribution groups built by ParallelismContext."""
+
+    @patch("torchtitan.distributed.parallelism_context.device_type", "cpu")
+    def test_every_rank_creates_every_group_in_storage_order(self):
+        # (dp_shard=2, cp=2, tp=2): rank = dp_shard * 4 + cp * 2 + tp. The
+        # first group combines (dp_shard, tp); the second adds cp, the ranks
+        # of FSDP's flattened dp_shard_cp axis with tp.
+        expected_by_rank = {
+            0: [[0, 1, 4, 5], list(range(8))],
+            3: [[2, 3, 6, 7], list(range(8))],
+        }
+        created_groups_by_rank = {}
+        for rank, expected in expected_by_rank.items():
+            dist.init_process_group("fake", store=FakeStore(), rank=rank, world_size=8)
+            try:
+                parallelism_context = ParallelismContext(
+                    dp_replicate=1,
+                    dp_shard=2,
+                    cp=2,
+                    tp=2,
+                    pp=1,
+                    ep=1,
+                    world_size=8,
+                    enable_sequence_parallel=False,
+                )
+                parallelism_context.build_mesh()
+                with patch.object(dist, "new_group", wraps=dist.new_group) as new_group:
+                    meshes = parallelism_context.get_redistribution_meshes(
+                        max_nccl_ctas=None
+                    )
+                created_groups_by_rank[rank] = [
+                    call.args[0] for call in new_group.call_args_list
+                ]
+                self.assertEqual([mesh.mesh.tolist() for mesh in meshes], expected)
+                self.assertEqual(
+                    meshes[0].mesh.tolist(),
+                    parallelism_context.get_mesh(["dp_shard", "tp"])
+                    .mesh.flatten()
+                    .tolist(),
+                )
+                self.assertIs(
+                    parallelism_context.get_redistribution_meshes(max_nccl_ctas=None),
+                    meshes,
+                )
+                with self.assertRaisesRegex(ValueError, "requires NCCL"):
+                    parallelism_context.get_redistribution_meshes(max_nccl_ctas=8)
+            finally:
+                dist.destroy_process_group()
+        # new_group is collective over WORLD, so every rank must create the
+        # same groups in the same order, including groups it is not part of.
+        self.assertEqual(created_groups_by_rank[0], created_groups_by_rank[3])
+        self.assertEqual(len(created_groups_by_rank[0]), 3)
 
 
 class TestOneDimensionalMeshesSkipFakeAxes(DTensorTestBase):
